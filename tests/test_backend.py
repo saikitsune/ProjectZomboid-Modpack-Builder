@@ -138,9 +138,9 @@ class BuildTests(unittest.TestCase):
             source = root / "source"
             framework = source / "mods" / "Framework"
             dependent = source / "mods" / "Dependent"
-            framework.mkdir(parents=True)
+            (framework / "common").mkdir(parents=True)
             (dependent / "42" / "media" / "lua" / "shared").mkdir(parents=True)
-            (framework / "mod.info").write_text(
+            (framework / "common" / "mod.info").write_text(
                 "name=Framework\nid=FrameworkB42\n",
                 encoding="utf-8",
             )
@@ -166,7 +166,12 @@ class BuildTests(unittest.TestCase):
             )
 
             framework_info = (
-                output / "Contents" / "mods" / "SaiPack_Framework" / "mod.info"
+                output
+                / "Contents"
+                / "mods"
+                / "SaiPack_Framework"
+                / "common"
+                / "mod.info"
             ).read_text(encoding="utf-8")
             dependent_info = (
                 output
@@ -373,8 +378,8 @@ class BuildTests(unittest.TestCase):
             (mod / "mod.info").write_text("id=ExampleB41\n", encoding="utf-8")
             (mod / "42" / "mod.info").write_text("id=ExampleB42\n", encoding="utf-8")
             dependent = root / "source" / "mods" / "Dependent"
-            dependent.mkdir(parents=True)
-            (dependent / "mod.info").write_text(
+            (dependent / "common").mkdir(parents=True)
+            (dependent / "common" / "mod.info").write_text(
                 "id=Dependent\nrequire=ExampleB41\n",
                 encoding="utf-8",
             )
@@ -393,7 +398,12 @@ class BuildTests(unittest.TestCase):
             amp_config = (output / "amp-config.txt").read_text()
             self.assertIn("Pack_ExampleB42", amp_config)
             dependent_info = (
-                output / "Contents" / "mods" / "Pack_Dependent" / "mod.info"
+                output
+                / "Contents"
+                / "mods"
+                / "Pack_Dependent"
+                / "common"
+                / "mod.info"
             ).read_text(encoding="utf-8")
             self.assertIn("require=Pack_ExampleB42", dependent_info)
 
@@ -444,6 +454,13 @@ class BuildTests(unittest.TestCase):
                 'if okValue and valueContainsRequiredMod(value, "NewMusic") then\n'
                 '    compatible[modId] = true\n'
                 'end\n',
+                encoding="utf-8",
+            )
+            (music_catalog / "NMLootResolvedPools.lua").write_text(
+                'require "loot/NMManagedSpawnCatalog"\n'
+                'require "loot/NMLootPolicySnapshot"\n'
+                'require "loot/NMLootRealizationAuthority"\n'
+                "NMLootResolvedPools = NMLootResolvedPools or {}\n",
                 encoding="utf-8",
             )
             simple_lua = simple_status / "media" / "lua" / "client"
@@ -524,6 +541,18 @@ class BuildTests(unittest.TestCase):
                 / "loot"
                 / "NMManagedSpawnCatalog.lua"
             ).read_text(encoding="utf-8")
+            relocated_resolved_pools = (
+                output
+                / "Contents"
+                / "mods"
+                / "SSP_Talis New Music"
+                / "42"
+                / "media"
+                / "lua"
+                / "server"
+                / "loot"
+                / "NMLootResolvedPools.lua"
+            )
             packed_simple_main = (
                 output
                 / "Contents"
@@ -567,6 +596,21 @@ class BuildTests(unittest.TestCase):
                 'valueContainsRequiredMod(value, "SSP_NewMusic")',
                 packed_music_catalog,
             )
+            self.assertTrue(relocated_resolved_pools.is_file())
+            self.assertFalse(
+                (
+                    output
+                    / "Contents"
+                    / "mods"
+                    / "SSP_Talis New Music"
+                    / "42"
+                    / "media"
+                    / "lua"
+                    / "shared"
+                    / "loot"
+                    / "NMLootResolvedPools.lua"
+                ).exists()
+            )
             self.assertIn('loadConfig("SSP_simpleStatus", playerNum)', packed_simple_main)
             self.assertIn('SSBar:new(playerObj, cfg, "SSP_simpleStatus")', packed_simple_main)
             self.assertIn(
@@ -574,10 +618,21 @@ class BuildTests(unittest.TestCase):
                 packed_simple_utils,
             )
             self.assertIn('modID~="SSP_errorMagnifier"', packed_fingerprint)
-            self.assertEqual(len(manifest["compatibility_patches"]), 9)
+            self.assertEqual(len(manifest["compatibility_patches"]), 10)
             self.assertEqual(
                 {patch["strategy"] for patch in manifest["compatibility_patches"]},
-                {"activated_mod_lookup", "known_file_context"},
+                {
+                    "activated_mod_lookup",
+                    "known_file_context",
+                    "known_file_relocation",
+                },
+            )
+            self.assertIn(
+                "new-music-server-loot-module",
+                {
+                    patch.get("name")
+                    for patch in manifest["compatibility_patches"]
+                },
             )
             self.assertEqual(
                 {
@@ -596,6 +651,156 @@ class BuildTests(unittest.TestCase):
                 },
             )
 
+    def test_promotes_known_legacy_mod_to_build_42_layout(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mods = root / "source" / "mods"
+            furry = mods / "Furry" / "42"
+            deceased = mods / "Anthro_Deceased"
+            furry.mkdir(parents=True)
+            (deceased / "media").mkdir(parents=True)
+            (furry / "mod.info").write_text(
+                "id=FurryModB42\n",
+                encoding="utf-8",
+            )
+            (deceased / "mod.info").write_text(
+                "name=Deceased Anthro Survivors\n"
+                "id=DeceasedAnthros\n"
+                "poster=poster.png\n"
+                "require=FurryModB42\n",
+                encoding="utf-8",
+            )
+            (deceased / "Poster.png").write_bytes(b"poster")
+            (deceased / "media" / "asset.txt").write_text(
+                "asset\n",
+                encoding="utf-8",
+            )
+            output = root / "output"
+
+            build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="SSP",
+                    sources=(root / "source",),
+                    output=output,
+                )
+            )
+
+            packed = output / "Contents" / "mods" / "SSP_Anthro_Deceased"
+            packed_info = (packed / "42" / "mod.info").read_text(encoding="utf-8")
+            manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse((packed / "mod.info").exists())
+            self.assertFalse((packed / "media").exists())
+            self.assertTrue((packed / "42" / "media" / "asset.txt").is_file())
+            self.assertTrue((packed / "42" / "poster.png").is_file())
+            packed_entry_names = {
+                path.name for path in (packed / "42").iterdir()
+            }
+            self.assertIn("poster.png", packed_entry_names)
+            self.assertNotIn("Poster.png", packed_entry_names)
+            self.assertIn("id=SSP_DeceasedAnthros", packed_info)
+            self.assertIn("require=SSP_FurryModB42", packed_info)
+            self.assertIn(
+                "deceased-anthros-build-42-layout",
+                {
+                    patch.get("name")
+                    for patch in manifest["compatibility_patches"]
+                },
+            )
+            self.assertIn(
+                "Mods=SSP_FurryModB42;SSP_DeceasedAnthros;",
+                (output / "amp-config.txt").read_text(encoding="utf-8"),
+            )
+
+    def test_removes_known_shelter_hold_base_self_imports(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            shelter = root / "source" / "mods" / "ShelterHold_Beehive"
+            script_prefix = (
+                "module Base\n"
+                "{\n"
+                "    imports\n"
+                "    {\n"
+                "        Base\n"
+                "    }\n\n"
+                "    evolvedrecipe HoneyCake\n"
+                "    {\n"
+                "    }\n"
+                "}\n"
+            )
+            for version in ("42", "42.13"):
+                script = shelter / version / "media" / "scripts" / "generated"
+                script.mkdir(parents=True)
+                (shelter / version / "mod.info").write_text(
+                    "id=ShelterHold_Beehive\n",
+                    encoding="utf-8",
+                )
+                (script / "Hold_evolvedrecipes.txt").write_text(
+                    script_prefix,
+                    encoding="utf-8",
+                )
+            output = root / "output"
+
+            build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="SSP",
+                    sources=(root / "source",),
+                    output=output,
+                )
+            )
+
+            packed = output / "Contents" / "mods" / "SSP_ShelterHold_Beehive"
+            for version in ("42", "42.13"):
+                rewritten = (
+                    packed
+                    / version
+                    / "media"
+                    / "scripts"
+                    / "generated"
+                    / "Hold_evolvedrecipes.txt"
+                ).read_text(encoding="utf-8")
+                self.assertIn("module Base", rewritten)
+                self.assertNotIn("imports", rewritten)
+                self.assertIn("evolvedrecipe HoneyCake", rewritten)
+            manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                {
+                    patch.get("name")
+                    for patch in manifest["compatibility_patches"]
+                },
+                {
+                    "shelter-hold-base-self-import-42",
+                    "shelter-hold-base-self-import-42-13",
+                },
+            )
+
+    def test_build_42_pack_rejects_unknown_root_only_active_mod(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            versioned = root / "source" / "mods" / "Versioned" / "42"
+            legacy = root / "source" / "mods" / "Legacy"
+            versioned.mkdir(parents=True)
+            legacy.mkdir(parents=True)
+            (versioned / "mod.info").write_text(
+                "id=VersionedB42\n",
+                encoding="utf-8",
+            )
+            (legacy / "mod.info").write_text(
+                "id=LegacyOnly\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(BuildError, "legacy root mod.info"):
+                build_modpack(
+                    BuildConfig(
+                        name="Pack",
+                        namespace="SSP",
+                        sources=(root / "source",),
+                        output=root / "output",
+                    )
+                )
+
     def test_known_compatibility_patch_fails_closed_after_upstream_change(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -605,6 +810,14 @@ class BuildTests(unittest.TestCase):
             (music / "mod.info").write_text("id=NewMusic\n", encoding="utf-8")
             (target / "NMTranslations.lua").write_text(
                 'local CHANGED_MOD_ID = "NewMusic"\n',
+                encoding="utf-8",
+            )
+            resolved = music / "42" / "media" / "lua" / "shared" / "loot"
+            resolved.mkdir(parents=True)
+            (resolved / "NMLootResolvedPools.lua").write_text(
+                'require "loot/NMManagedSpawnCatalog"\n'
+                'require "loot/NMLootPolicySnapshot"\n'
+                'require "loot/NMLootRealizationAuthority"\n',
                 encoding="utf-8",
             )
 

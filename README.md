@@ -35,7 +35,9 @@ CraftableMilitaryFences -> SaiPack_CraftableMilitaryFences
 - Stable Mod ID namespacing
 - Rewriting of `id`, `require`, `loadModAfter`, `loadModBefore`, and `incompatible`
 - Targeted Lua activated-mod checks rewritten for direct calls, escaped IDs, and local aliases of `getActivatedMods()`
-- Fail-closed compatibility patches for known mod-file lookup contexts
+- Fail-closed compatibility patches for known mod-file, script, and runtime-ID contexts
+- Exact Build 42 layout fixes for reviewed legacy folders and server-only Lua modules
+- Build 42 preflight rejection of unrecognized root-only active mods
 - Applied compatibility patches and occurrence-level categorized unresolved references recorded in `manifest.json`
 - Automatic original-ID incompatibility guards
 - Dependency ordering and cycle detection
@@ -213,6 +215,7 @@ Build-blocking errors:
 - Explicit incompatibilities between bundled mods
 - Invalid namespace
 - No discovered mods
+- An active root-only legacy mod in a pack whose selected IDs require Build 42
 - Attempting to overwrite a directory not created by this builder
 
 Warnings are categorized in `manifest.json`:
@@ -226,6 +229,8 @@ Warnings are categorized in `manifest.json`:
 A remaining `runtime_mod_lookup` or `mod_file_access` warning means the cited occurrence was **not** automatically fixed and needs review or a deterministic compatibility patch. Classification is per occurrence, so a harmless content namespace elsewhere in the same file no longer masks a sensitive lookup. Internal identifiers such as `SeedSeasonIndicator` used for Lua tables or `PZAPI.ModOptions` are classified as `content_namespace`, retained in `manifest.json`, and omitted from the primary actionable GUI warning list.
 
 The builder deliberately avoids blind global replacement. A Mod ID can also be a module filename, translation key, save key, script namespace, option identifier, or comment. Targeted API rewrites and fail-closed compatibility patches are used instead.
+
+Known layout and script fixes are equally strict: they run only for an exact source folder, path, and expected content. They are recorded in `compatibility_patches` with strategies such as `known_layout_context`, `known_file_relocation`, and `known_file_context`. If an upstream mod changes the expected layout or text, the build stops for review instead of applying a speculative edit.
 
 ## Project files
 

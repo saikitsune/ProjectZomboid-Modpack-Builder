@@ -242,7 +242,208 @@ _KNOWN_COMPATIBILITY_PATCHES = (
         "original_id": "errorMagnifier",
         "expected": 'modID~="errorMagnifier"',
     },
+    {
+        "name": "shelter-hold-base-self-import-42",
+        "source_folder": "ShelterHold_Beehive",
+        "relative_file": "42/media/scripts/generated/Hold_evolvedrecipes.txt",
+        "expected": "    imports\n    {\n        Base\n    }\n\n",
+        "replacement": "",
+    },
+    {
+        "name": "shelter-hold-base-self-import-42-13",
+        "source_folder": "ShelterHold_Beehive",
+        "relative_file": "42.13/media/scripts/generated/Hold_evolvedrecipes.txt",
+        "expected": "    imports\n    {\n        Base\n    }\n\n",
+        "replacement": "",
+    },
 )
+
+
+_KNOWN_LAYOUT_COMPATIBILITY_PATCHES = (
+    {
+        "name": "deceased-anthros-build-42-layout",
+        "source_folder": "Anthro_Deceased",
+        "kind": "legacy_root_to_version",
+        "original_id": "DeceasedAnthros",
+        "target_directory": "42",
+        "required_entries": ("mod.info", "media", "Poster.png"),
+        "poster_metadata": "poster.png",
+        "poster_source": "Poster.png",
+    },
+    {
+        "name": "new-music-server-loot-module",
+        "source_folder": "Talis New Music",
+        "kind": "relocate_file",
+        "source_file": "42/media/lua/shared/loot/NMLootResolvedPools.lua",
+        "destination_file": "42/media/lua/server/loot/NMLootResolvedPools.lua",
+        "expected_prefix": (
+            'require "loot/NMManagedSpawnCatalog"\n'
+            'require "loot/NMLootPolicySnapshot"\n'
+            'require "loot/NMLootRealizationAuthority"\n'
+        ),
+    },
+)
+
+
+def _known_layout_specs(source_folder: str) -> list[dict[str, object]]:
+    return [
+        specification
+        for specification in _KNOWN_LAYOUT_COMPATIBILITY_PATCHES
+        if specification["source_folder"] == source_folder
+    ]
+
+
+def _validate_known_layout_compatibility_patches(mod: DiscoveredMod) -> None:
+    for specification in _known_layout_specs(mod.folder_name):
+        name = str(specification["name"])
+        kind = str(specification["kind"])
+        if kind == "legacy_root_to_version":
+            root_info = mod.mod_directory / "mod.info"
+            original_id = str(specification["original_id"])
+            if not root_info.is_file() or _read_id(root_info) != original_id:
+                raise BuildError(
+                    f"Compatibility patch {name} expected root Mod ID "
+                    f"{original_id!r}: {root_info}"
+                )
+            target = mod.mod_directory / str(specification["target_directory"])
+            if target.exists() or (mod.mod_directory / "common").exists():
+                raise BuildError(
+                    f"Compatibility patch {name} expected a root-only legacy layout: "
+                    f"{mod.mod_directory}"
+                )
+            missing = [
+                entry
+                for entry in specification["required_entries"]
+                if not (mod.mod_directory / str(entry)).exists()
+            ]
+            if missing:
+                raise BuildError(
+                    f"Compatibility patch {name} missing expected entries in "
+                    f"{mod.mod_directory}: {', '.join(str(item) for item in missing)}"
+                )
+            poster_metadata = str(specification["poster_metadata"])
+            metadata_text = root_info.read_text(encoding="utf-8-sig")
+            if f"poster={poster_metadata}" not in metadata_text:
+                raise BuildError(
+                    f"Compatibility patch {name} expected poster={poster_metadata} in "
+                    f"{root_info}"
+                )
+        elif kind == "relocate_file":
+            source = mod.mod_directory / str(specification["source_file"])
+            destination = mod.mod_directory / str(specification["destination_file"])
+            if not source.is_file() or destination.exists():
+                raise BuildError(
+                    f"Compatibility patch {name} expected source {source} and no "
+                    f"destination {destination}"
+                )
+            text = source.read_text(encoding="utf-8-sig")
+            if not text.startswith(str(specification["expected_prefix"])):
+                raise BuildError(
+                    f"Compatibility patch {name} found unexpected content in {source}"
+                )
+        else:
+            raise BuildError(f"Unknown compatibility layout patch kind: {kind}")
+
+
+def _apply_known_layout_compatibility_patches(
+    mods_root: Path,
+    destination: Path,
+    source_folder: str,
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for specification in _known_layout_specs(source_folder):
+        name = str(specification["name"])
+        kind = str(specification["kind"])
+        if kind == "legacy_root_to_version":
+            target = destination / str(specification["target_directory"])
+            entries = sorted(destination.iterdir(), key=lambda path: path.name.lower())
+            target.mkdir()
+            for entry in entries:
+                shutil.move(str(entry), str(target / entry.name))
+            poster_source = target / str(specification["poster_source"])
+            poster_destination = target / str(specification["poster_metadata"])
+            temporary_poster = target / ".pzmodpack-poster-case.tmp"
+            shutil.move(str(poster_source), str(temporary_poster))
+            shutil.move(str(temporary_poster), str(poster_destination))
+            records.append(
+                {
+                    "name": name,
+                    "strategy": "known_layout_context",
+                    "file": destination.relative_to(mods_root).as_posix(),
+                    "destination": target.relative_to(mods_root).as_posix(),
+                    "entries_moved": len(entries),
+                }
+            )
+        elif kind == "relocate_file":
+            source = destination / str(specification["source_file"])
+            relocated = destination / str(specification["destination_file"])
+            relocated.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(relocated))
+            records.append(
+                {
+                    "name": name,
+                    "strategy": "known_file_relocation",
+                    "file": relocated.relative_to(mods_root).as_posix(),
+                    "source_file": source.relative_to(mods_root).as_posix(),
+                    "files_moved": 1,
+                }
+            )
+        else:
+            raise BuildError(f"Unknown compatibility layout patch kind: {kind}")
+    return records
+
+
+def _mod_id_locations(mod: DiscoveredMod, mod_id: str) -> list[Path]:
+    return [
+        path.relative_to(mod.mod_directory)
+        for path in mod.mod_directory.rglob("mod.info")
+        if _read_id(path) == mod_id
+    ]
+
+
+def _is_build_42_location(path: Path) -> bool:
+    return len(path.parts) > 1 and bool(
+        re.fullmatch(r"42(?:\..+)?", path.parts[0])
+    )
+
+
+def _validate_active_mod_layouts(
+    mods: list[DiscoveredMod],
+    active_mod_ids: dict[str, str],
+) -> None:
+    selected_locations = {
+        mod.folder_name: _mod_id_locations(
+            mod,
+            active_mod_ids.get(mod.folder_name, mod.mod_ids[-1]),
+        )
+        for mod in mods
+    }
+    targets_build_42 = any(
+        any(_is_build_42_location(path) for path in locations)
+        and Path("mod.info") not in locations
+        for locations in selected_locations.values()
+    )
+    if not targets_build_42:
+        return
+    for mod in mods:
+        locations = selected_locations[mod.folder_name]
+        if any(
+            path.parts[0] == "common" or _is_build_42_location(path)
+            for path in locations
+        ):
+            continue
+        has_legacy_layout_patch = any(
+            specification["kind"] == "legacy_root_to_version"
+            for specification in _known_layout_specs(mod.folder_name)
+        )
+        if has_legacy_layout_patch:
+            continue
+        active_id = active_mod_ids.get(mod.folder_name, mod.mod_ids[-1])
+        raise BuildError(
+            f"Active Mod ID {active_id!r} in folder {mod.folder_name!r} exists only "
+            "in a legacy root mod.info, but the selected IDs indicate a Build 42 "
+            "pack. Add a common/42 layout or a fail-closed compatibility rule."
+        )
 
 
 def _apply_known_compatibility_patches(
@@ -256,12 +457,16 @@ def _apply_known_compatibility_patches(
         packed_folder = mods_root / f"{prefix}{source_folder}"
         if not packed_folder.is_dir():
             continue
-        original_id = str(specification["original_id"])
-        if original_id not in mapping:
-            raise BuildError(
-                f"Compatibility patch {specification['name']} cannot resolve Mod ID "
-                f"{original_id!r}"
-            )
+        original_value = specification.get("original_id")
+        original_id = str(original_value) if original_value is not None else None
+        packed_id = ""
+        if original_id is not None:
+            if original_id not in mapping:
+                raise BuildError(
+                    f"Compatibility patch {specification['name']} cannot resolve "
+                    f"Mod ID {original_id!r}"
+                )
+            packed_id = mapping[original_id]
         relative_file = str(specification["relative_file"])
         path = packed_folder / relative_file
         if not path.is_file():
@@ -270,15 +475,18 @@ def _apply_known_compatibility_patches(
             )
         text = path.read_text(encoding="utf-8-sig")
         expected = str(specification["expected"])
-        packed_id = mapping[original_id]
         if "replacement" in specification:
             replacement = (
                 str(specification["replacement"])
                 .replace("{packed_id_lower}", packed_id.lower())
                 .replace("{packed_id}", packed_id)
             )
-        else:
+        elif original_id is not None:
             replacement = expected.replace(original_id, packed_id)
+        else:
+            raise BuildError(
+                f"Compatibility patch {specification['name']} has no replacement"
+            )
         count = text.count(expected)
         if count != 1:
             raise BuildError(
@@ -508,6 +716,9 @@ def build_modpack(
             raise BuildError(
                 f"Active Mod ID {active_id!r} does not belong to folder {folder!r}"
             )
+    for mod in mods:
+        _validate_known_layout_compatibility_patches(mod)
+    _validate_active_mod_layouts(mods, config.active_mod_ids)
     mapping = {
         mod_id: prefix + mod_id
         for mod in mods
@@ -532,6 +743,7 @@ def build_modpack(
     mods_root = output / "Contents" / "mods"
     mods_root.mkdir(parents=True)
     manifest_mods: list[dict[str, object]] = []
+    compatibility_patches: list[dict[str, object]] = []
     for index, mod in enumerate(mods, start=1):
         copy_progress = 15 + int((index - 1) * 60 / len(mods))
         _emit_progress(
@@ -541,6 +753,13 @@ def build_modpack(
         )
         destination = mods_root / f"{prefix}{mod.folder_name}"
         shutil.copytree(mod.mod_directory, destination)
+        compatibility_patches.extend(
+            _apply_known_layout_compatibility_patches(
+                mods_root,
+                destination,
+                mod.folder_name,
+            )
+        )
         for mod_info in destination.rglob("mod.info"):
             original = mod_info.read_text(encoding="utf-8-sig")
             mod_info.write_text(
@@ -559,7 +778,9 @@ def build_modpack(
             }
         )
     _emit_progress(progress, 78, "Rewriting runtime Mod ID lookups")
-    compatibility_patches = _rewrite_known_id_checks(mods_root, reference_mapping)
+    compatibility_patches.extend(
+        _rewrite_known_id_checks(mods_root, reference_mapping)
+    )
     compatibility_patches.extend(
         _apply_known_compatibility_patches(mods_root, prefix, reference_mapping)
     )
