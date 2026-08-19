@@ -273,6 +273,46 @@ class BuildTests(unittest.TestCase):
                 {"content_namespace"},
             )
 
+    def test_audit_classifies_each_sensitive_occurrence_independently(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mod = root / "source" / "mods" / "AuditExample"
+            lua = mod / "media" / "lua" / "client"
+            lua.mkdir(parents=True)
+            (mod / "mod.info").write_text("id=AuditExample\n", encoding="utf-8")
+            (lua / "audit.lua").write_text(
+                "local AuditExample = {}\n"
+                'PZAPI.ModOptions:create("AuditExample", "Audit Example")\n'
+                "local modID = modInfo:getId()\n"
+                'if modID ~= "AuditExample" then return end\n'
+                'getModFileWriter("AuditExample", "settings.json", true, false)\n',
+                encoding="utf-8",
+            )
+
+            build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="SSP",
+                    sources=(root / "source",),
+                    output=root / "output",
+                )
+            )
+
+            manifest = json.loads(
+                (root / "output" / "manifest.json").read_text(encoding="utf-8")
+            )
+            details = [
+                detail
+                for detail in manifest["warning_details"]
+                if detail.get("file", "").endswith("audit.lua")
+                and "AuditExample" in detail.get("original_ids", [])
+            ]
+            self.assertEqual(
+                {detail["category"] for detail in details},
+                {"content_namespace", "runtime_mod_lookup", "mod_file_access"},
+            )
+            self.assertTrue(all(detail.get("line_numbers") for detail in details))
+
     def test_build_reports_monotonic_progress_until_complete(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -364,10 +404,14 @@ class BuildTests(unittest.TestCase):
             journal = mods / "Skill Recovery Journal"
             beyond = mods / "BeyondTen"
             music = mods / "Talis New Music"
+            simple_status = mods / "SimpleStatus"
+            error_magnifier = mods / "errorMagnifier"
             for folder, mod_id in (
                 (journal, "SkillRecoveryJournal"),
                 (beyond, "BeyondTen"),
                 (music, "NewMusic"),
+                (simple_status, "simpleStatus"),
+                (error_magnifier, "errorMagnifier"),
             ):
                 folder.mkdir(parents=True)
                 (folder / "mod.info").write_text(f"id={mod_id}\n", encoding="utf-8")
@@ -388,6 +432,38 @@ class BuildTests(unittest.TestCase):
             music_lua.mkdir(parents=True)
             (music_lua / "NMTranslations.lua").write_text(
                 'local MOD_ID = "NewMusic"\nreturn getModFileReader(MOD_ID, "x", false)\n',
+                encoding="utf-8",
+            )
+            music_catalog = music / "42" / "media" / "lua" / "shared" / "loot"
+            music_catalog.mkdir(parents=True)
+            (music_catalog / "NMManagedSpawnCatalog.lua").write_text(
+                'local function isTargetModId(modId)\n'
+                '    local lower = string.lower(modId)\n'
+                '    return lower == "newmusic" or lower == "talisnewmusic"\n'
+                'end\n'
+                'if okValue and valueContainsRequiredMod(value, "NewMusic") then\n'
+                '    compatible[modId] = true\n'
+                'end\n',
+                encoding="utf-8",
+            )
+            simple_lua = simple_status / "media" / "lua" / "client"
+            simple_lua.mkdir(parents=True)
+            (simple_lua / "ss.main.lua").write_text(
+                'local cfg = utils.fn.loadConfig("simpleStatus", playerNum)\n'
+                'bar = SSBar:new(playerObj, cfg, "simpleStatus")\n',
+                encoding="utf-8",
+            )
+            (simple_lua / "ss.utils.lua").write_text(
+                'local file, _ = getModFileWriter("simpleStatus", "log.txt", true, true)\n',
+                encoding="utf-8",
+            )
+            error_lua = error_magnifier / "media" / "lua" / "client"
+            error_lua.mkdir(parents=True)
+            (error_lua / "fingerPrint_Main.lua").write_text(
+                'local modID = modInfo and modInfo:getId()\n'
+                'if modID and modID~="errorMagnifier" then\n'
+                '    print(modID)\n'
+                'end\n',
                 encoding="utf-8",
             )
             output = root / "output"
@@ -436,6 +512,48 @@ class BuildTests(unittest.TestCase):
                 / "core"
                 / "NMTranslations.lua"
             ).read_text(encoding="utf-8")
+            packed_music_catalog = (
+                output
+                / "Contents"
+                / "mods"
+                / "SSP_Talis New Music"
+                / "42"
+                / "media"
+                / "lua"
+                / "shared"
+                / "loot"
+                / "NMManagedSpawnCatalog.lua"
+            ).read_text(encoding="utf-8")
+            packed_simple_main = (
+                output
+                / "Contents"
+                / "mods"
+                / "SSP_SimpleStatus"
+                / "media"
+                / "lua"
+                / "client"
+                / "ss.main.lua"
+            ).read_text(encoding="utf-8")
+            packed_simple_utils = (
+                output
+                / "Contents"
+                / "mods"
+                / "SSP_SimpleStatus"
+                / "media"
+                / "lua"
+                / "client"
+                / "ss.utils.lua"
+            ).read_text(encoding="utf-8")
+            packed_fingerprint = (
+                output
+                / "Contents"
+                / "mods"
+                / "SSP_errorMagnifier"
+                / "media"
+                / "lua"
+                / "client"
+                / "fingerPrint_Main.lua"
+            ).read_text(encoding="utf-8")
             manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
 
             self.assertIn('mods:contains("SSP_SkillRecoveryJournal")', packed_beyond)
@@ -444,10 +562,38 @@ class BuildTests(unittest.TestCase):
                 packed_legacy_beyond,
             )
             self.assertIn('local MOD_ID = "SSP_NewMusic"', packed_music)
-            self.assertEqual(len(manifest["compatibility_patches"]), 3)
+            self.assertIn('lower == "ssp_newmusic"', packed_music_catalog)
+            self.assertIn(
+                'valueContainsRequiredMod(value, "SSP_NewMusic")',
+                packed_music_catalog,
+            )
+            self.assertIn('loadConfig("SSP_simpleStatus", playerNum)', packed_simple_main)
+            self.assertIn('SSBar:new(playerObj, cfg, "SSP_simpleStatus")', packed_simple_main)
+            self.assertIn(
+                'getModFileWriter("SSP_simpleStatus", "log.txt"',
+                packed_simple_utils,
+            )
+            self.assertIn('modID~="SSP_errorMagnifier"', packed_fingerprint)
+            self.assertEqual(len(manifest["compatibility_patches"]), 9)
             self.assertEqual(
                 {patch["strategy"] for patch in manifest["compatibility_patches"]},
                 {"activated_mod_lookup", "known_file_context"},
+            )
+            self.assertEqual(
+                {
+                    patch["name"]
+                    for patch in manifest["compatibility_patches"]
+                    if patch["strategy"] == "known_file_context"
+                },
+                {
+                    "new-music-mod-file-reader-id",
+                    "new-music-target-mod-id",
+                    "new-music-child-requirement-id",
+                    "simple-status-load-config-id",
+                    "simple-status-bar-config-id",
+                    "simple-status-log-writer-id",
+                    "error-magnifier-self-id",
+                },
             )
 
     def test_known_compatibility_patch_fails_closed_after_upstream_change(self) -> None:

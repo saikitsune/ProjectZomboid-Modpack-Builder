@@ -340,7 +340,7 @@ class ModpackWindow(QMainWindow):
         heading.setObjectName("sectionTitle")
         layout.addWidget(heading)
         explanation = QLabel(
-            "Build the pack first. SteamCMD will upload the generated Contents/mods folder "
+            "Build the pack first. SteamCMD will upload the generated Contents folder "
             "and preview.png. Workshop ID 0 creates a new item; an existing ID updates it."
         )
         explanation.setWordWrap(True)

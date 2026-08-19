@@ -36,7 +36,7 @@ CraftableMilitaryFences -> SaiPack_CraftableMilitaryFences
 - Rewriting of `id`, `require`, `loadModAfter`, `loadModBefore`, and `incompatible`
 - Targeted Lua activated-mod checks rewritten for direct calls, escaped IDs, and local aliases of `getActivatedMods()`
 - Fail-closed compatibility patches for known mod-file lookup contexts
-- Applied compatibility patches and categorized unresolved references recorded in `manifest.json`
+- Applied compatibility patches and occurrence-level categorized unresolved references recorded in `manifest.json`
 - Automatic original-ID incompatibility guards
 - Dependency ordering and cycle detection
 - Duplicate Mod ID detection
@@ -218,12 +218,12 @@ Build-blocking errors:
 Warnings are categorized in `manifest.json`:
 
 - `metadata`: unresolved or external metadata dependency
-- `runtime_mod_lookup`: an original ID remains in an activated-mod or mod-info lookup after automatic rewrites
-- `mod_file_access`: an original ID remains in a mod-file API context
+- `runtime_mod_lookup`: an original ID remains in an activated-mod lookup, mod-info lookup, or comparison against a runtime `getId()`/`getModID()` value after automatic rewrites
+- `mod_file_access`: an original ID remains in a `getModFileReader` or `getModFileWriter` context
 - `content_namespace`: the token is used as a Lua table, function namespace, or options identifier rather than a runtime Mod-ID lookup
 - `ambiguous_string`: the builder cannot safely determine the token's purpose
 
-A remaining `runtime_mod_lookup` warning means the cited lookup was **not** automatically fixed and needs review or a deterministic compatibility patch. Internal identifiers such as `SeedSeasonIndicator` used for Lua tables or `PZAPI.ModOptions` are classified as `content_namespace`, retained in `manifest.json`, and omitted from the primary actionable GUI warning list.
+A remaining `runtime_mod_lookup` or `mod_file_access` warning means the cited occurrence was **not** automatically fixed and needs review or a deterministic compatibility patch. Classification is per occurrence, so a harmless content namespace elsewhere in the same file no longer masks a sensitive lookup. Internal identifiers such as `SeedSeasonIndicator` used for Lua tables or `PZAPI.ModOptions` are classified as `content_namespace`, retained in `manifest.json`, and omitted from the primary actionable GUI warning list.
 
 The builder deliberately avoids blind global replacement. A Mod ID can also be a module filename, translation key, save key, script namespace, option identifier, or comment. Targeted API rewrites and fail-closed compatibility patches are used instead.
 

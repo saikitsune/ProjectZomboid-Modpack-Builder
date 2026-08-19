@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pz-modpack-builder"
-version = "0.4.1"
+version = "0.4.2"
 description = "Build namespaced Project Zomboid Workshop modpacks"
 readme = "README.md"
 requires-python = ">=3.11"

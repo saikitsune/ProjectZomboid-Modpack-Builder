@@ -196,6 +196,52 @@ _KNOWN_COMPATIBILITY_PATCHES = (
         "original_id": "NewMusic",
         "expected": 'local MOD_ID = "NewMusic"',
     },
+    {
+        "name": "new-music-target-mod-id",
+        "source_folder": "Talis New Music",
+        "relative_file": "42/media/lua/shared/loot/NMManagedSpawnCatalog.lua",
+        "original_id": "NewMusic",
+        "expected": 'return lower == "newmusic" or lower == "talisnewmusic"',
+        "replacement": (
+            'return lower == "newmusic" or lower == "talisnewmusic" '
+            'or lower == "{packed_id_lower}"'
+        ),
+    },
+    {
+        "name": "new-music-child-requirement-id",
+        "source_folder": "Talis New Music",
+        "relative_file": "42/media/lua/shared/loot/NMManagedSpawnCatalog.lua",
+        "original_id": "NewMusic",
+        "expected": 'valueContainsRequiredMod(value, "NewMusic")',
+    },
+    {
+        "name": "simple-status-load-config-id",
+        "source_folder": "SimpleStatus",
+        "relative_file": "media/lua/client/ss.main.lua",
+        "original_id": "simpleStatus",
+        "expected": 'utils.fn.loadConfig("simpleStatus", playerNum)',
+    },
+    {
+        "name": "simple-status-bar-config-id",
+        "source_folder": "SimpleStatus",
+        "relative_file": "media/lua/client/ss.main.lua",
+        "original_id": "simpleStatus",
+        "expected": 'SSBar:new(playerObj, cfg, "simpleStatus")',
+    },
+    {
+        "name": "simple-status-log-writer-id",
+        "source_folder": "SimpleStatus",
+        "relative_file": "media/lua/client/ss.utils.lua",
+        "original_id": "simpleStatus",
+        "expected": 'getModFileWriter("simpleStatus", "log.txt", true, true)',
+    },
+    {
+        "name": "error-magnifier-self-id",
+        "source_folder": "errorMagnifier",
+        "relative_file": "media/lua/client/fingerPrint_Main.lua",
+        "original_id": "errorMagnifier",
+        "expected": 'modID~="errorMagnifier"',
+    },
 )
 
 
@@ -224,7 +270,15 @@ def _apply_known_compatibility_patches(
             )
         text = path.read_text(encoding="utf-8-sig")
         expected = str(specification["expected"])
-        replacement = expected.replace(original_id, mapping[original_id])
+        packed_id = mapping[original_id]
+        if "replacement" in specification:
+            replacement = (
+                str(specification["replacement"])
+                .replace("{packed_id_lower}", packed_id.lower())
+                .replace("{packed_id}", packed_id)
+            )
+        else:
+            replacement = expected.replace(original_id, packed_id)
         count = text.count(expected)
         if count != 1:
             raise BuildError(
@@ -256,53 +310,114 @@ def _hardcoded_reference_details(
             text = path.read_text(encoding="utf-8-sig")
         except (UnicodeDecodeError, OSError):
             continue
-        found = [
-            original
-            for original in mapping
-            if re.search(
-                rf"(?<![A-Za-z0-9_]){re.escape(original)}(?![A-Za-z0-9_])",
+        aliases = set(
+            re.findall(
+                r"(?:local\s+)?([A-Za-z_]\w*)\s*=\s*getActivatedMods\(\)",
                 text,
             )
-        ]
-        if found:
-            relative = path.relative_to(mods_root).as_posix()
-            categorized: dict[str, list[str]] = {}
-            for original in found:
-                quoted_id = rf"['\"]\\*{re.escape(original)}['\"]"
-                if re.search(
-                    rf"getModFileReader\s*\(\s*{quoted_id}",
+        )
+        runtime_id_variables = set(
+            re.findall(
+                r"(?:local\s+)?([A-Za-z_]\w*)\s*=\s*[^\n]*"
+                r"(?::\s*get(?:Id|ID|ModID)\s*\(\)|getModInfoByID\s*\()",
+                text,
+            )
+        )
+        categorized: dict[tuple[str, str], set[int]] = {}
+        for original in mapping:
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9_]){re.escape(original)}(?![A-Za-z0-9_])"
+            )
+            for match in pattern.finditer(text):
+                category = _reference_occurrence_category(
                     text,
-                ):
-                    category = "mod_file_access"
-                elif re.search(
-                    rf"(?:getModInfoByID\s*\(|(?:getActivatedMods\(\)|[A-Za-z_]\w*)"
-                    rf"\s*:\s*contains\s*\()\s*{quoted_id}",
-                    text,
-                ):
-                    category = "runtime_mod_lookup"
-                elif re.search(
-                    rf"(?:local\s+{re.escape(original)}\b|function\s+{re.escape(original)}[.:]"
-                    rf"|\b{re.escape(original)}[.:]|ModOptions:create\s*\(\s*{quoted_id})",
-                    text,
-                ):
-                    category = "content_namespace"
-                else:
-                    category = "ambiguous_string"
-                categorized.setdefault(category, []).append(original)
-            for category, identifiers in categorized.items():
-                message = (
-                    f"{relative} contains original Mod ID reference(s): "
-                    f"{', '.join(identifiers)}"
+                    match,
+                    aliases,
+                    runtime_id_variables,
                 )
-                details.append(
-                    {
-                        "category": category,
-                        "file": relative,
-                        "original_ids": identifiers,
-                        "message": message,
-                    }
-                )
+                line_number = text.count("\n", 0, match.start()) + 1
+                categorized.setdefault((category, original), set()).add(line_number)
+        relative = path.relative_to(mods_root).as_posix()
+        for (category, original), line_numbers in categorized.items():
+            ordered_lines = sorted(line_numbers)
+            line_summary = ", ".join(str(item) for item in ordered_lines)
+            message = (
+                f"{relative}:{line_summary} contains original Mod ID reference: "
+                f"{original}"
+            )
+            details.append(
+                {
+                    "category": category,
+                    "file": relative,
+                    "line_numbers": ordered_lines,
+                    "original_ids": [original],
+                    "message": message,
+                }
+            )
     return details
+
+
+def _reference_occurrence_category(
+    text: str,
+    match: re.Match[str],
+    activated_mod_aliases: set[str],
+    runtime_id_variables: set[str],
+) -> str:
+    before = text[max(0, match.start() - 500) : match.start()]
+    after = text[match.end() : min(len(text), match.end() + 200)]
+    quote = re.search(r"(?P<quote>['\"])\\*$", before)
+    quoted = quote is not None and after.startswith(quote.group("quote"))
+    before_quote = before[: quote.start()] if quote is not None else before
+    after_quote = after[1:] if quoted else after
+
+    if quoted and re.search(
+        r"\bgetModFile(?:Reader|Writer)\s*\(\s*$",
+        before_quote,
+    ):
+        return "mod_file_access"
+
+    receivers = {"getActivatedMods()", *activated_mod_aliases}
+    receiver_pattern = "|".join(
+        re.escape(receiver) for receiver in sorted(receivers, key=len, reverse=True)
+    )
+    if quoted and (
+        re.search(r"\bgetModInfoByID\s*\(\s*$", before_quote)
+        or re.search(
+            rf"(?:{receiver_pattern})\s*:\s*contains\s*\(\s*$",
+            before_quote,
+        )
+    ):
+        return "runtime_mod_lookup"
+
+    if quoted and runtime_id_variables:
+        variable_pattern = "|".join(
+            re.escape(variable)
+            for variable in sorted(runtime_id_variables, key=len, reverse=True)
+        )
+        if re.search(
+            rf"\b(?:{variable_pattern})\s*(?:==|~=)\s*$",
+            before_quote,
+        ) or re.match(
+            rf"\s*(?:==|~=)\s*(?:{variable_pattern})\b",
+            after_quote,
+        ):
+            return "runtime_mod_lookup"
+
+    if (
+        re.search(r"(?:\blocal|\bfunction)\s+$", before)
+        or before.endswith((".", ":"))
+        or after.startswith((".", ":"))
+        or (
+            quoted
+            and re.search(
+                r"\bModOptions(?::|\.)\s*(?:create|getOptions)\s*\(\s*$",
+                before_quote,
+            )
+        )
+    ):
+        return "content_namespace"
+
+    return "ambiguous_string"
 
 
 def _mod_references(mod: DiscoveredMod, field: str) -> set[str]:
