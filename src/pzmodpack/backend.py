@@ -16,6 +16,35 @@ class DiscoveredMod:
     folder_name: str
     mod_ids: tuple[str, ...]
     workshop_id: str | None
+    display_name: str = ""
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class BundledModConflict:
+    declaring_mod: DiscoveredMod
+    declaring_mod_id: str
+    incompatible_mod: DiscoveredMod
+    incompatible_mod_id: str
+
+    @property
+    def message(self) -> str:
+        return (
+            f"Bundled Mod ID {self.declaring_mod_id!r} declares bundled Mod ID "
+            f"{self.incompatible_mod_id!r} incompatible"
+        )
+
+
+@dataclass(frozen=True)
+class BundledModRequirement:
+    declaring_mod: DiscoveredMod
+    declaring_mod_id: str
+    required_mod_id: str
+    providers: tuple[DiscoveredMod, ...]
+
+    @property
+    def is_missing(self) -> bool:
+        return not self.providers
 
 
 @dataclass(frozen=True)
@@ -25,8 +54,24 @@ class ValidationIssue:
     message: str
 
 
-def validate_mods(mods: Iterable[DiscoveredMod]) -> list[ValidationIssue]:
+def validate_mods(
+    mods: Iterable[DiscoveredMod],
+    active_mod_ids: dict[str, str] | None = None,
+) -> list[ValidationIssue]:
+    """Validate a bundle in which every supplied mod folder is selected."""
     mod_list = list(mods)
+    return validate_mod_selection(mod_list, mod_list, active_mod_ids)
+
+
+def validate_mod_selection(
+    available_mods: Iterable[DiscoveredMod],
+    selected_mods: Iterable[DiscoveredMod],
+    active_mod_ids: dict[str, str] | None = None,
+) -> list[ValidationIssue]:
+    """Validate selected folders against the complete discovered source inventory."""
+    available_list = list(available_mods)
+    mod_list = list(selected_mods)
+    active_mod_ids = active_mod_ids or {}
     owners: dict[str, list[str]] = {}
     for mod in mod_list:
         for mod_id in mod.mod_ids:
@@ -40,37 +85,56 @@ def validate_mods(mods: Iterable[DiscoveredMod]) -> list[ValidationIssue]:
         for mod_id, folders in sorted(owners.items())
         if len(folders) > 1
     ]
-    bundled_ids = set(owners)
-    for mod in mod_list:
-        for required in sorted(_mod_requirements(mod) - bundled_ids):
-            issues.append(
-                ValidationIssue(
-                    severity="warning",
-                    code="external_dependency",
-                    message=(
-                        f"{mod.folder_name} requires {required!r}, which is not included "
-                        "in this bundle"
-                    ),
-                )
+    selected = set(mod_list)
+    for requirement in find_mod_requirements(available_list):
+        mod = requirement.declaring_mod
+        if mod not in selected or requirement.declaring_mod_id != _active_mod_id(
+            mod, active_mod_ids
+        ):
+            continue
+        selected_providers = [
+            provider for provider in requirement.providers if provider in selected
+        ]
+        if selected_providers:
+            continue
+        if requirement.providers:
+            provider_names = ", ".join(
+                provider.display_name or provider.folder_name
+                for provider in requirement.providers
             )
-    seen_conflicts: set[tuple[str, str]] = set()
-    for mod in mod_list:
-        declaring_id = mod.mod_ids[-1]
-        for incompatible in sorted(_mod_references(mod, "incompatible") & bundled_ids):
-            pair = tuple(sorted((declaring_id, incompatible)))
-            if pair in seen_conflicts:
-                continue
-            seen_conflicts.add(pair)
             issues.append(
                 ValidationIssue(
                     severity="error",
-                    code="bundled_incompatibility",
+                    code="excluded_required_mod",
                     message=(
-                        f"Bundled Mod ID {declaring_id!r} declares bundled Mod ID "
-                        f"{incompatible!r} incompatible"
+                        f"{mod.display_name or mod.folder_name} "
+                        f"({requirement.declaring_mod_id}) requires Mod ID "
+                        f"{requirement.required_mod_id!r}, provided by excluded bundled "
+                        f"mod {provider_names}. Include a provider before building."
                     ),
                 )
             )
+        else:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="missing_required_mod",
+                    message=(
+                        f"{mod.display_name or mod.folder_name} "
+                        f"({requirement.declaring_mod_id}) requires Mod ID "
+                        f"{requirement.required_mod_id!r}, but no discovered bundled mod "
+                        "provides it. Add its Workshop item or source before building."
+                    ),
+                )
+            )
+    for conflict in find_bundled_conflicts(mod_list):
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="bundled_incompatibility",
+                message=conflict.message,
+            )
+        )
     return issues
 
 
@@ -85,6 +149,7 @@ class BuildConfig:
     preview: Path | None = None
     visibility: int = 2
     active_mod_ids: dict[str, str] = field(default_factory=dict)
+    included_mod_ids: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -631,32 +696,158 @@ def _reference_occurrence_category(
 def _mod_references(mod: DiscoveredMod, field: str) -> set[str]:
     references: set[str] = set()
     for mod_info in mod.mod_directory.rglob("mod.info"):
-        for raw_line in mod_info.read_text(encoding="utf-8-sig").splitlines():
-            key, separator, value = raw_line.partition("=")
-            if separator and key.strip().lower() == field.lower():
-                references.update(
-                    item.strip().lstrip("\\")
-                    for item in re.split(r"[;,]", value)
-                    if item.strip().lstrip("\\")
-                )
+        references.update(_mod_info_references(mod_info, field))
     return references
+
+
+def _mod_info_references(mod_info: Path, field: str) -> set[str]:
+    references: set[str] = set()
+    for raw_line in mod_info.read_text(encoding="utf-8-sig").splitlines():
+        key, separator, value = raw_line.partition("=")
+        if separator and key.strip().lower() == field.lower():
+            references.update(
+                item.strip().lstrip("\\")
+                for item in re.split(r"[;,]", value)
+                if item.strip().lstrip("\\")
+            )
+    return references
+
+
+def find_bundled_conflicts(
+    mods: Iterable[DiscoveredMod],
+) -> tuple[BundledModConflict, ...]:
+    """Return unique metadata conflicts between discovered bundled mod folders."""
+    mod_list = list(mods)
+    owners: dict[str, list[DiscoveredMod]] = {}
+    for mod in mod_list:
+        for mod_id in mod.mod_ids:
+            owners.setdefault(mod_id, []).append(mod)
+
+    conflicts: list[BundledModConflict] = []
+    seen: set[tuple[tuple[str, str, str], tuple[str, str, str]]] = set()
+    for mod in mod_list:
+        for mod_info in sorted(mod.mod_directory.rglob("mod.info")):
+            declaring_id = _read_id(mod_info)
+            if declaring_id is None:
+                continue
+            for incompatible_id in sorted(
+                _mod_info_references(mod_info, "incompatible")
+            ):
+                for incompatible_mod in owners.get(incompatible_id, []):
+                    if incompatible_mod == mod:
+                        # One source folder is the selection unit. Its versioned
+                        # directories are resolved by Project Zomboid at runtime.
+                        continue
+                    declaring_endpoint = (
+                        str(mod.source_root),
+                        mod.folder_name,
+                        declaring_id,
+                    )
+                    incompatible_endpoint = (
+                        str(incompatible_mod.source_root),
+                        incompatible_mod.folder_name,
+                        incompatible_id,
+                    )
+                    pair = tuple(sorted((declaring_endpoint, incompatible_endpoint)))
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    conflicts.append(
+                        BundledModConflict(
+                            declaring_mod=mod,
+                            declaring_mod_id=declaring_id,
+                            incompatible_mod=incompatible_mod,
+                            incompatible_mod_id=incompatible_id,
+                        )
+                    )
+    return tuple(conflicts)
+
+
+def find_mod_requirements(
+    mods: Iterable[DiscoveredMod],
+) -> tuple[BundledModRequirement, ...]:
+    """Return exact ``require=`` relationships declared by bundled mod metadata."""
+    mod_list = list(mods)
+    owners: dict[str, list[DiscoveredMod]] = {}
+    for mod in mod_list:
+        for mod_id in mod.mod_ids:
+            owners.setdefault(mod_id, []).append(mod)
+
+    requirements: list[BundledModRequirement] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for mod in mod_list:
+        for mod_info in sorted(mod.mod_directory.rglob("mod.info")):
+            declaring_id = _read_id(mod_info)
+            if declaring_id is None:
+                continue
+            for required_id in sorted(_mod_info_references(mod_info, "require")):
+                # A folder is the selection unit, so a requirement provided by
+                # another version directory in the same folder is already present.
+                if required_id in mod.mod_ids:
+                    continue
+                key = (
+                    str(mod.source_root),
+                    mod.folder_name,
+                    declaring_id,
+                    required_id,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                requirements.append(
+                    BundledModRequirement(
+                        declaring_mod=mod,
+                        declaring_mod_id=declaring_id,
+                        required_mod_id=required_id,
+                        providers=tuple(
+                            provider
+                            for provider in owners.get(required_id, [])
+                            if provider != mod
+                        ),
+                    )
+                )
+    return tuple(requirements)
+
+
+def select_mods(
+    mods: Iterable[DiscoveredMod],
+    included_mod_ids: tuple[str, ...] | None,
+) -> list[DiscoveredMod]:
+    """Select whole mod folders by any Mod ID declared inside each folder."""
+    mod_list = list(mods)
+    if included_mod_ids is None:
+        return mod_list
+    included = set(included_mod_ids)
+    return [mod for mod in mod_list if included.intersection(mod.mod_ids)]
 
 
 def _mod_requirements(mod: DiscoveredMod) -> set[str]:
     return _mod_references(mod, "require")
 
 
-def _dependency_order(mods: list[DiscoveredMod]) -> list[DiscoveredMod]:
-    owner = {mod_id: mod.folder_name for mod in mods for mod_id in mod.mod_ids}
+def _active_mod_id(
+    mod: DiscoveredMod,
+    active_mod_ids: dict[str, str],
+) -> str:
+    selected = active_mod_ids.get(mod.folder_name, mod.mod_ids[-1])
+    return selected if selected in mod.mod_ids else mod.mod_ids[-1]
+
+
+def _dependency_order(
+    mods: list[DiscoveredMod],
+    active_mod_ids: dict[str, str],
+) -> list[DiscoveredMod]:
     by_name = {mod.folder_name: mod for mod in mods}
-    dependencies = {
-        mod.folder_name: {
-            owner[required]
-            for required in _mod_requirements(mod)
-            if required in owner and owner[required] != mod.folder_name
-        }
-        for mod in mods
-    }
+    dependencies = {mod.folder_name: set() for mod in mods}
+    for requirement in find_mod_requirements(mods):
+        mod = requirement.declaring_mod
+        if requirement.declaring_mod_id != _active_mod_id(mod, active_mod_ids):
+            continue
+        dependencies[mod.folder_name].update(
+            provider.folder_name
+            for provider in requirement.providers
+            if provider.folder_name != mod.folder_name
+        )
     ordered: list[DiscoveredMod] = []
     remaining = list(mods)
     while remaining:
@@ -694,11 +885,31 @@ def build_modpack(
     if config.visibility not in {0, 1, 2, 3}:
         raise BuildError("Workshop visibility must be 0, 1, 2, or 3")
     _emit_progress(progress, 5, "Discovering mod sources")
-    mods = discover_mods(config.sources)
-    if not mods:
+    discovered_mods = discover_mods(config.sources)
+    if not discovered_mods:
         raise BuildError("No mods were discovered in the selected sources")
+    mods = select_mods(discovered_mods, config.included_mod_ids)
+    if not mods:
+        raise BuildError("No bundled mod folders are selected for this build")
+    mods_by_folder = {mod.folder_name: mod for mod in mods}
+    discovered_by_folder = {mod.folder_name: mod for mod in discovered_mods}
+    for folder, active_id in config.active_mod_ids.items():
+        if folder not in mods_by_folder:
+            if folder in discovered_by_folder:
+                raise BuildError(
+                    f"Active Mod ID override references excluded folder: {folder}"
+                )
+            raise BuildError(f"Active Mod ID override references unknown folder: {folder}")
+        if active_id not in mods_by_folder[folder].mod_ids:
+            raise BuildError(
+                f"Active Mod ID {active_id!r} does not belong to folder {folder!r}"
+            )
     _emit_progress(progress, 10, f"Validating {len(mods)} mod folders")
-    issues = validate_mods(mods)
+    issues = validate_mod_selection(
+        discovered_mods,
+        mods,
+        config.active_mod_ids,
+    )
     errors = [issue.message for issue in issues if issue.severity == "error"]
     if errors:
         raise BuildError("\n".join(errors))
@@ -707,15 +918,8 @@ def build_modpack(
         for issue in issues
         if issue.severity == "warning"
     ]
-    mods = _dependency_order(mods)
+    mods = _dependency_order(mods, config.active_mod_ids)
     mods_by_folder = {mod.folder_name: mod for mod in mods}
-    for folder, active_id in config.active_mod_ids.items():
-        if folder not in mods_by_folder:
-            raise BuildError(f"Active Mod ID override references unknown folder: {folder}")
-        if active_id not in mods_by_folder[folder].mod_ids:
-            raise BuildError(
-                f"Active Mod ID {active_id!r} does not belong to folder {folder!r}"
-            )
     for mod in mods:
         _validate_known_layout_compatibility_patches(mod)
     _validate_active_mod_layouts(mods, config.active_mod_ids)
@@ -770,6 +974,7 @@ def build_modpack(
             {
                 "source": str(mod.source_root),
                 "source_folder": mod.folder_name,
+                "display_name": mod.display_name or mod.folder_name,
                 "packed_folder": destination.name,
                 "source_workshop_id": mod.workshop_id,
                 "original_mod_ids": list(mod.mod_ids),
@@ -788,6 +993,21 @@ def build_modpack(
         mapping[config.active_mod_ids.get(mod.folder_name, mod.mod_ids[-1])]
         for mod in mods
     ]
+    manifest_requirements = [
+        {
+            "source_folder": requirement.declaring_mod.folder_name,
+            "declaring_mod_id": requirement.declaring_mod_id,
+            "packed_declaring_mod_id": mapping[requirement.declaring_mod_id],
+            "required_mod_id": requirement.required_mod_id,
+            "packed_required_mod_id": reference_mapping[requirement.required_mod_id],
+            "provider_folders": [
+                provider.folder_name for provider in requirement.providers
+            ],
+        }
+        for requirement in find_mod_requirements(mods)
+        if requirement.declaring_mod_id
+        == _active_mod_id(requirement.declaring_mod, config.active_mod_ids)
+    ]
     _emit_progress(progress, 86, "Auditing unresolved Mod ID references")
     hardcoded_warning_details = _hardcoded_reference_details(mods_root, mapping)
     warning_details = validation_warning_details + hardcoded_warning_details
@@ -801,8 +1021,21 @@ def build_modpack(
         "visibility": config.visibility,
         "preview": str(Path(config.preview).resolve()) if config.preview else None,
         "mapping": mapping,
+        "mod_selection": {
+            "included_mod_ids": sorted(mapping),
+            "excluded_mods": [
+                {
+                    "source_folder": mod.folder_name,
+                    "source_workshop_id": mod.workshop_id,
+                    "mod_ids": list(mod.mod_ids),
+                }
+                for mod in discovered_mods
+                if mod not in mods
+            ],
+        },
         "active_mod_ids": active_ids,
         "active_mod_id_overrides": config.active_mod_ids,
+        "requirements": manifest_requirements,
         "compatibility_patches": compatibility_patches,
         "mods": manifest_mods,
         "warning_details": warning_details,
@@ -842,10 +1075,22 @@ def build_modpack(
 
 
 def _read_id(mod_info: Path) -> str | None:
+    return _read_mod_info_value(mod_info, "id", strip_leading_slash=True)
+
+
+def _read_mod_info_value(
+    mod_info: Path,
+    field: str,
+    *,
+    strip_leading_slash: bool = False,
+) -> str | None:
     for raw_line in mod_info.read_text(encoding="utf-8-sig").splitlines():
         key, separator, value = raw_line.partition("=")
-        if separator and key.strip().lower() == "id":
-            return value.strip().lstrip("\\") or None
+        if separator and key.strip().lower() == field.lower():
+            cleaned = value.strip()
+            if strip_leading_slash:
+                cleaned = cleaned.lstrip("\\")
+            return cleaned or None
     return None
 
 
@@ -929,17 +1174,22 @@ def discover_mods(source_roots: Iterable[Path]) -> list[DiscoveredMod]:
         if (mods_root / "mod.info").is_file():
             candidates = [mods_root]
         for mod_directory in candidates:
+            mod_info_files = sorted(
+                mod_directory.rglob("mod.info"),
+                key=lambda path: (
+                    len(path.relative_to(mod_directory).parts),
+                    str(path),
+                ),
+            )
             ids = tuple(
                 dict.fromkeys(
                     mod_id
-                    for info in sorted(
-                        mod_directory.rglob("mod.info"),
-                        key=lambda path: (len(path.relative_to(mod_directory).parts), str(path)),
-                    )
+                    for info in mod_info_files
                     if (mod_id := _read_id(info))
                 )
             )
             if ids:
+                display_info = mod_info_files[-1]
                 discovered.append(
                     DiscoveredMod(
                         source_root=source,
@@ -947,6 +1197,13 @@ def discover_mods(source_roots: Iterable[Path]) -> list[DiscoveredMod]:
                         folder_name=mod_directory.name,
                         mod_ids=ids,
                         workshop_id=_workshop_id(source),
+                        display_name=(
+                            _read_mod_info_value(display_info, "name")
+                            or mod_directory.name
+                        ),
+                        description=(
+                            _read_mod_info_value(display_info, "description") or ""
+                        ),
                     )
                 )
     return discovered

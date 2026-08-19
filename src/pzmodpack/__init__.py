@@ -7,6 +7,6 @@ from .backend import DiscoveredMod, discover_mods
 try:
     __version__ = version("pz-modpack-builder")
 except PackageNotFoundError:
-    __version__ = "0.4.3-dev"
+    __version__ = "0.5.3-dev"
 
 __all__ = ["DiscoveredMod", "__version__", "discover_mods"]

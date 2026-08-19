@@ -9,9 +9,12 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -21,6 +24,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -30,9 +35,16 @@ from .backend import (
     BuildConfig,
     BuildError,
     BuildReport,
+    BundledModConflict,
+    BundledModRequirement,
+    DiscoveredMod,
     build_modpack,
     discover_mods,
+    find_bundled_conflicts,
+    find_mod_requirements,
+    select_mods,
     validate_mods,
+    validate_mod_selection,
 )
 from .project import ProjectSettings, load_project, save_project
 from .session import (
@@ -66,6 +78,38 @@ class OperationWorker(QThread):
             self.failed.emit(str(error))
 
 
+class WorkshopDownloadWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, int, str)
+
+    def __init__(
+        self,
+        client: SteamCmdClient,
+        workshop_ids: tuple[str, ...],
+        credentials: SteamCredentials,
+        snapshot_root: Path,
+    ) -> None:
+        super().__init__()
+        self.client = client
+        self.workshop_ids = workshop_ids
+        self.credentials = credentials
+        self.snapshot_root = snapshot_root
+
+    def run(self) -> None:
+        try:
+            result = download_and_snapshot(
+                self.client,
+                self.workshop_ids,
+                self.credentials,
+                self.snapshot_root,
+                progress=self.progress.emit,
+            )
+            self.succeeded.emit(result)
+        except Exception as error:  # noqa: BLE001 - Qt thread boundary reports failures.
+            self.failed.emit(str(error))
+
+
 class BuildWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
@@ -81,6 +125,437 @@ class BuildWorker(QThread):
             self.succeeded.emit(report)
         except Exception as error:  # noqa: BLE001 - Qt thread boundary must report all failures.
             self.failed.emit(str(error))
+
+
+class BundledModSelectionDialog(QDialog):
+    def __init__(
+        self,
+        mods: list[DiscoveredMod],
+        included_mod_ids: tuple[str, ...] | None,
+        parent: QWidget | None = None,
+        active_mod_ids: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select bundled mods")
+        self.resize(1120, 690)
+        self._mods = mods
+        self._conflicts = find_bundled_conflicts(mods)
+        self._requirements = find_mod_requirements(mods)
+        self._active_mod_ids = active_mod_ids or {}
+        self._updating = False
+        selected_ids = (
+            {mod_id for mod in mods for mod_id in mod.mod_ids}
+            if included_mod_ids is None
+            else set(included_mod_ids)
+        )
+        initially_selected = {
+            mod for mod in mods if selected_ids.intersection(mod.mod_ids)
+        }
+        while True:
+            additions = {
+                requirement.providers[0]
+                for requirement in self._requirements
+                if requirement.declaring_mod in initially_selected
+                and requirement.declaring_mod_id
+                == self._active_mod_id(requirement.declaring_mod)
+                and requirement.providers
+                and not any(
+                    provider in initially_selected
+                    for provider in requirement.providers
+                )
+            }
+            if not additions - initially_selected:
+                break
+            initially_selected.update(additions)
+        selected_ids.update(
+            mod_id for mod in initially_selected for mod_id in mod.mod_ids
+        )
+
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Each row is one bundled mod folder. Select the variants to copy into the "
+            "pack. Game-version directories inside a selected folder stay together. "
+            "Required bundled mods are selected automatically. Missing requirements and "
+            "incompatible combinations must be resolved before building."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(
+            ("Include", "Bundled mod", "Mod ID(s)", "Requires", "Conflicts with")
+        )
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self._items: dict[DiscoveredMod, QTreeWidgetItem] = {}
+        for mod in mods:
+            item = QTreeWidgetItem(self.tree)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                0,
+                Qt.CheckState.Checked
+                if selected_ids.intersection(mod.mod_ids)
+                else Qt.CheckState.Unchecked,
+            )
+            item.setText(1, mod.display_name or mod.folder_name)
+            item.setText(2, "; ".join(mod.mod_ids))
+            item.setText(3, self._requirement_summary(mod))
+            item.setText(4, self._conflict_summary(mod))
+            item.setToolTip(1, f"Source folder: {mod.folder_name}")
+            if mod.workshop_id:
+                item.setToolTip(2, f"Workshop item {mod.workshop_id}")
+            item.setToolTip(3, self._requirement_details(mod))
+            self._items[mod] = item
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.tree, 1)
+
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMaximumHeight(170)
+        self.details.setPlaceholderText("Select a row to view its source and description.")
+        layout.addWidget(self.details)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.tree.itemChanged.connect(self._item_changed)
+        self.tree.currentItemChanged.connect(self._show_details)
+        if self.tree.topLevelItemCount():
+            self.tree.setCurrentItem(self.tree.topLevelItem(0))
+        self._refresh_status()
+
+    def _active_mod_id(self, mod: DiscoveredMod) -> str:
+        selected = self._active_mod_ids.get(mod.folder_name, mod.mod_ids[-1])
+        return selected if selected in mod.mod_ids else mod.mod_ids[-1]
+
+    def _requirements_for(
+        self,
+        mod: DiscoveredMod,
+    ) -> list[BundledModRequirement]:
+        active_id = self._active_mod_id(mod)
+        return [
+            requirement
+            for requirement in self._requirements
+            if requirement.declaring_mod == mod
+            and requirement.declaring_mod_id == active_id
+        ]
+
+    @staticmethod
+    def _provider_names(requirement: BundledModRequirement) -> str:
+        return " or ".join(
+            provider.display_name or provider.folder_name
+            for provider in requirement.providers
+        )
+
+    def _requirement_summary(self, mod: DiscoveredMod) -> str:
+        summaries = []
+        for requirement in self._requirements_for(mod):
+            if requirement.is_missing:
+                summaries.append(f"{requirement.required_mod_id} [MISSING]")
+            else:
+                summaries.append(requirement.required_mod_id)
+        return "; ".join(summaries) or "None"
+
+    def _requirement_details(self, mod: DiscoveredMod) -> str:
+        requirements = self._requirements_for(mod)
+        if not requirements:
+            return "No required bundled Mod IDs declared by the active mod.info."
+        lines = []
+        for requirement in requirements:
+            if requirement.is_missing:
+                lines.append(
+                    f"{requirement.required_mod_id}: missing; add its Workshop item or source"
+                )
+            else:
+                lines.append(
+                    f"{requirement.required_mod_id}: provided by "
+                    f"{self._provider_names(requirement)}"
+                )
+        return "\n".join(lines)
+
+    def _conflicts_for(self, mod: DiscoveredMod) -> list[BundledModConflict]:
+        return [
+            conflict
+            for conflict in self._conflicts
+            if conflict.declaring_mod == mod or conflict.incompatible_mod == mod
+        ]
+
+    def _other_mod(
+        self,
+        conflict: BundledModConflict,
+        mod: DiscoveredMod,
+    ) -> DiscoveredMod:
+        return (
+            conflict.incompatible_mod
+            if conflict.declaring_mod == mod
+            else conflict.declaring_mod
+        )
+
+    def _conflict_summary(self, mod: DiscoveredMod) -> str:
+        ids = {
+            conflict.incompatible_mod_id
+            if conflict.declaring_mod == mod
+            else conflict.declaring_mod_id
+            for conflict in self._conflicts_for(mod)
+        }
+        return "; ".join(sorted(ids)) or "None"
+
+    def _is_checked(self, mod: DiscoveredMod) -> bool:
+        return self._items[mod].checkState(0) == Qt.CheckState.Checked
+
+    def _mod_for_item(self, item: QTreeWidgetItem) -> DiscoveredMod | None:
+        return next(
+            (mod for mod, candidate in self._items.items() if candidate is item),
+            None,
+        )
+
+    def _requirement_closure(
+        self,
+        mod: DiscoveredMod,
+        selected: set[DiscoveredMod],
+    ) -> set[DiscoveredMod]:
+        closure = {mod}
+        pending = [mod]
+        while pending:
+            current = pending.pop()
+            for requirement in self._requirements_for(current):
+                if not requirement.providers:
+                    continue
+                provider = next(
+                    (
+                        candidate
+                        for candidate in requirement.providers
+                        if candidate in selected or candidate in closure
+                    ),
+                    requirement.providers[0],
+                )
+                if provider not in closure:
+                    closure.add(provider)
+                    pending.append(provider)
+        return closure
+
+    def _required_by_selection(
+        self,
+        mod: DiscoveredMod,
+        selected: set[DiscoveredMod],
+    ) -> list[DiscoveredMod]:
+        dependents = []
+        for declaring_mod in selected:
+            for requirement in self._requirements_for(declaring_mod):
+                if mod not in requirement.providers:
+                    continue
+                if any(
+                    provider != mod and provider in selected
+                    for provider in requirement.providers
+                ):
+                    continue
+                dependents.append(declaring_mod)
+                break
+        return dependents
+
+    def _set_checked_mods(self, selected: set[DiscoveredMod]) -> None:
+        self._updating = True
+        try:
+            for mod, item in self._items.items():
+                item.setCheckState(
+                    0,
+                    Qt.CheckState.Checked
+                    if mod in selected
+                    else Qt.CheckState.Unchecked,
+                )
+        finally:
+            self._updating = False
+
+    def _item_changed(self, item: QTreeWidgetItem, _column: int) -> None:
+        if self._updating:
+            return
+        selected_mod = self._mod_for_item(item)
+        if selected_mod is None:
+            return
+        checked = {mod for mod in self._mods if self._is_checked(mod)}
+        if item.checkState(0) != Qt.CheckState.Checked:
+            dependents = self._required_by_selection(selected_mod, checked)
+            if dependents:
+                checked.add(selected_mod)
+                self._set_checked_mods(checked)
+                names = ", ".join(
+                    dependent.display_name or dependent.folder_name
+                    for dependent in dependents
+                )
+                self._refresh_status(
+                    f"Cannot exclude {selected_mod.display_name or selected_mod.folder_name}; "
+                    f"it is required by {names}."
+                )
+            else:
+                self._refresh_status()
+            return
+
+        selected_before = set(checked)
+        selected_before.discard(selected_mod)
+        closure = self._requirement_closure(selected_mod, selected_before)
+        desired = selected_before | closure
+        deselected: set[DiscoveredMod] = set()
+        for conflict in self._conflicts:
+            first = conflict.declaring_mod
+            second = conflict.incompatible_mod
+            if first not in desired or second not in desired:
+                continue
+            if first in closure and second not in closure:
+                candidate = second
+            elif second in closure and first not in closure:
+                candidate = first
+            else:
+                continue
+            if self._required_by_selection(candidate, desired - {candidate}):
+                continue
+            desired.remove(candidate)
+            deselected.add(candidate)
+        self._set_checked_mods(desired)
+
+        auto_selected = closure - {selected_mod} - selected_before
+        actions = []
+        if auto_selected:
+            actions.append(
+                "Selected required mod(s): "
+                + ", ".join(
+                    mod.display_name or mod.folder_name
+                    for mod in sorted(auto_selected, key=lambda entry: entry.folder_name)
+                )
+            )
+        if deselected:
+            actions.append(
+                "Deselected incompatible mod(s): "
+                + ", ".join(
+                    mod.display_name or mod.folder_name
+                    for mod in sorted(deselected, key=lambda entry: entry.folder_name)
+                )
+            )
+        self._refresh_status(". ".join(actions) + "." if actions else None)
+
+    def _selected_requirement_problems(
+        self,
+    ) -> tuple[list[BundledModRequirement], list[BundledModRequirement]]:
+        missing: list[BundledModRequirement] = []
+        excluded: list[BundledModRequirement] = []
+        for mod in self._mods:
+            if not self._is_checked(mod):
+                continue
+            for requirement in self._requirements_for(mod):
+                if requirement.is_missing:
+                    missing.append(requirement)
+                elif not any(self._is_checked(item) for item in requirement.providers):
+                    excluded.append(requirement)
+        return missing, excluded
+
+    def _selected_conflicts(self) -> list[BundledModConflict]:
+        return [
+            conflict
+            for conflict in self._conflicts
+            if self._is_checked(conflict.declaring_mod)
+            and self._is_checked(conflict.incompatible_mod)
+        ]
+
+    def _refresh_status(self, action: str | None = None) -> None:
+        selected_count = sum(self._is_checked(mod) for mod in self._mods)
+        conflicts = self._selected_conflicts()
+        missing_requirements, excluded_requirements = (
+            self._selected_requirement_problems()
+        )
+        ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setEnabled(
+            selected_count > 0
+            and not conflicts
+            and not missing_requirements
+            and not excluded_requirements
+        )
+        if not selected_count:
+            self.status.setText("Select at least one bundled mod folder.")
+        elif missing_requirements:
+            labels = ", ".join(
+                f"{item.required_mod_id} (needed by "
+                f"{item.declaring_mod.display_name or item.declaring_mod.folder_name})"
+                for item in missing_requirements[:4]
+            )
+            remainder = (
+                f" (+{len(missing_requirements) - 4} more)"
+                if len(missing_requirements) > 4
+                else ""
+            )
+            self.status.setText(
+                f"Missing required Mod ID(s): {labels}{remainder}. Add their Workshop "
+                "items or source folders before building."
+            )
+        elif excluded_requirements:
+            labels = ", ".join(
+                f"{item.required_mod_id} (needed by "
+                f"{item.declaring_mod.display_name or item.declaring_mod.folder_name})"
+                for item in excluded_requirements[:4]
+            )
+            self.status.setText(f"Include the required bundled mod(s): {labels}.")
+        elif conflicts:
+            pairs = ", ".join(
+                f"{item.declaring_mod_id} ↔ {item.incompatible_mod_id}"
+                for item in conflicts[:4]
+            )
+            remainder = f" (+{len(conflicts) - 4} more)" if len(conflicts) > 4 else ""
+            self.status.setText(
+                f"Resolve {len(conflicts)} incompatible selection(s): {pairs}{remainder}"
+            )
+        elif action:
+            self.status.setText(action)
+        else:
+            self.status.setText(
+                f"{selected_count} of {len(self._mods)} bundled mod folders will be included."
+            )
+
+    def _show_details(
+        self,
+        current: QTreeWidgetItem | None,
+        _previous: QTreeWidgetItem | None,
+    ) -> None:
+        mod = next(
+            (candidate for candidate, item in self._items.items() if item is current),
+            None,
+        )
+        if mod is None:
+            self.details.clear()
+            return
+        lines = [
+            f"Name: {mod.display_name or mod.folder_name}",
+            f"Folder: {mod.folder_name}",
+            f"Mod ID(s): {'; '.join(mod.mod_ids)}",
+            f"Active Mod ID: {self._active_mod_id(mod)}",
+            f"Workshop item: {mod.workshop_id or 'local source'}",
+            f"Requires: {self._requirement_summary(mod)}",
+            f"Conflicts with: {self._conflict_summary(mod)}",
+        ]
+        requirements = self._requirements_for(mod)
+        if requirements:
+            lines.extend(("", self._requirement_details(mod)))
+        if mod.description:
+            lines.extend(("", mod.description))
+        self.details.setPlainText("\n".join(lines))
+
+    def selected_mod_ids(self) -> tuple[str, ...]:
+        return tuple(
+            mod_id
+            for mod in self._mods
+            if self._is_checked(mod)
+            for mod_id in mod.mod_ids
+        )
 
 
 class ModpackWindow(QMainWindow):
@@ -127,6 +602,7 @@ class ModpackWindow(QMainWindow):
         self.active_ids_edit.setPlaceholderText(
             "Optional active Mod ID overrides, one per line: FolderName=ModId"
         )
+        self.included_mod_ids: tuple[str, ...] | None = None
         self.source_list = QListWidget()
         self.source_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
 
@@ -236,6 +712,13 @@ class ModpackWindow(QMainWindow):
         form.addRow("Workshop preview", preview_row)
         form.addRow("Workshop visibility", self.visibility_combo)
         form.addRow("Active ID overrides", self.active_ids_edit)
+        bundled_mod_row = QHBoxLayout()
+        self.mod_selection_label = QLabel("All discovered bundled mods")
+        bundled_mod_row.addWidget(self.mod_selection_label, 1)
+        select_bundled_mods = QPushButton("Select bundled mods...")
+        select_bundled_mods.clicked.connect(self.select_bundled_mods)
+        bundled_mod_row.addWidget(select_bundled_mods)
+        form.addRow("Bundled mod selection", bundled_mod_row)
         output_row = QHBoxLayout()
         output_row.addWidget(self.output_edit, 1)
         browse_output = QPushButton("Browse...")
@@ -321,10 +804,20 @@ class ModpackWindow(QMainWindow):
 
         layout.addWidget(QLabel("Project Zomboid Workshop URLs or IDs"))
         layout.addWidget(self.workshop_input, 1)
-        download = QPushButton("Download, snapshot, and add to pack")
-        download.setObjectName("primaryButton")
-        download.clicked.connect(self.download_workshop_items)
-        layout.addWidget(download)
+        self.download_button = QPushButton("Download, snapshot, and add to pack")
+        self.download_button.setObjectName("primaryButton")
+        self.download_button.clicked.connect(self.download_workshop_items)
+        layout.addWidget(self.download_button)
+        self.download_status = QLabel("Ready to download")
+        self.download_status.setObjectName("downloadStatus")
+        self.download_status.hide()
+        layout.addWidget(self.download_status)
+        self.download_progress = QProgressBar()
+        self.download_progress.setRange(0, 100)
+        self.download_progress.setValue(0)
+        self.download_progress.setFormat("%p%")
+        self.download_progress.hide()
+        layout.addWidget(self.download_progress)
         note = QLabel(
             "Passwords and Steam Guard codes use a restricted temporary SteamCMD runscript, "
             "are redacted from output, and are deleted immediately after the operation."
@@ -415,6 +908,7 @@ class ModpackWindow(QMainWindow):
             ),
             visibility=int(self.visibility_combo.currentData()),
             active_mod_ids=self.active_mod_id_overrides(),
+            included_mod_ids=self.included_mod_ids,
         )
 
     def save_project_to(self, path: Path) -> None:
@@ -443,6 +937,8 @@ class ModpackWindow(QMainWindow):
         self.source_list.clear()
         for source in settings.sources:
             self.add_source_path(source)
+        self.included_mod_ids = settings.included_mod_ids
+        self._update_mod_selection_label()
         self.workshop_input.setPlainText("\n".join(settings.workshop_items))
         self._clear_transient_secrets()
         self.log.appendPlainText(f"Project loaded from {Path(path).resolve()}")
@@ -483,6 +979,8 @@ class ModpackWindow(QMainWindow):
         existing = {self.source_list.item(index).text() for index in range(self.source_list.count())}
         if resolved not in existing:
             self.source_list.addItem(resolved)
+            self.included_mod_ids = None
+            self._update_mod_selection_label()
 
     def add_source_dialog(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select Workshop item or mod source")
@@ -490,8 +988,13 @@ class ModpackWindow(QMainWindow):
             self.add_source_path(Path(selected))
 
     def remove_selected_sources(self) -> None:
+        removed = False
         for item in self.source_list.selectedItems():
             self.source_list.takeItem(self.source_list.row(item))
+            removed = True
+        if removed:
+            self.included_mod_ids = None
+            self._update_mod_selection_label()
 
     def choose_output(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select output parent directory")
@@ -692,6 +1195,7 @@ class ModpackWindow(QMainWindow):
         self._clear_transient_secrets()
 
         def completed(result: object) -> None:
+            self._set_download_running(False)
             batch = result
             self.log.appendPlainText(batch.command_result.output.strip())
             if not batch.command_result.success:
@@ -704,19 +1208,61 @@ class ModpackWindow(QMainWindow):
                     f"{snapshot.sha256[:16]} at {snapshot.path}"
                 )
 
+        def failed(message: str) -> None:
+            self._set_download_running(False)
+            self.log.appendPlainText(f"Workshop download failed: {message}")
+
         self.log.appendPlainText(
             f"Downloading {len(workshop_ids)} Workshop item(s) through SteamCMD..."
         )
-        self._execute(
-            lambda: download_and_snapshot(
-                client,
-                workshop_ids,
-                credentials,
-                snapshot_root,
-            ),
-            completed,
-            "Workshop download failed",
+        self._set_download_running(True)
+        if not self.run_async:
+            try:
+                result = download_and_snapshot(
+                    client,
+                    workshop_ids,
+                    credentials,
+                    snapshot_root,
+                    progress=self._update_download_progress,
+                )
+            except Exception as error:  # noqa: BLE001 - synchronous path mirrors worker.
+                failed(str(error))
+                return
+            completed(result)
+            return
+
+        worker = WorkshopDownloadWorker(
+            client,
+            workshop_ids,
+            credentials,
+            snapshot_root,
         )
+        self._workers.add(worker)
+        worker.progress.connect(self._update_download_progress)
+        worker.succeeded.connect(completed)
+        worker.failed.connect(failed)
+        worker.finished.connect(lambda: self._workers.discard(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _set_download_running(self, running: bool) -> None:
+        self.download_button.setEnabled(not running)
+        self.download_progress.setVisible(running)
+        self.download_status.setVisible(running)
+        if running:
+            self.download_progress.setRange(0, 100)
+            self.download_progress.setValue(0)
+            self.download_status.setText("Starting Workshop download...")
+
+    def _update_download_progress(
+        self,
+        current: int,
+        total: int,
+        message: str,
+    ) -> None:
+        self.download_progress.setRange(0, max(total, 1))
+        self.download_progress.setValue(current)
+        self.download_status.setText(message)
 
     def upload_built_modpack(self) -> None:
         self.log.clear()
@@ -768,12 +1314,60 @@ class ModpackWindow(QMainWindow):
             "Workshop upload failed",
         )
 
+    def _update_mod_selection_label(self) -> None:
+        if not hasattr(self, "mod_selection_label"):
+            return
+        if self.included_mod_ids is None:
+            self.mod_selection_label.setText("All discovered bundled mods")
+        else:
+            self.mod_selection_label.setText(
+                f"Custom selection ({len(self.included_mod_ids)} Mod ID(s))"
+            )
+
+    def _show_mod_selection_dialog(
+        self,
+        mods: list[DiscoveredMod],
+        active_mod_ids: dict[str, str],
+    ) -> bool:
+        dialog = BundledModSelectionDialog(
+            mods,
+            self.included_mod_ids,
+            self,
+            active_mod_ids=active_mod_ids,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        self.included_mod_ids = dialog.selected_mod_ids()
+        self._update_mod_selection_label()
+        selected_count = len(select_mods(mods, self.included_mod_ids))
+        self.log.appendPlainText(
+            f"Selected {selected_count} of {len(mods)} bundled mod folder(s)."
+        )
+        return True
+
+    def select_bundled_mods(self) -> None:
+        self.log.clear()
+        if not self.source_paths():
+            self.log.appendPlainText("Selection failed: add at least one source folder.")
+            return
+        try:
+            mods = discover_mods(self.source_paths())
+            active_mod_ids = self.active_mod_id_overrides()
+        except (OSError, ValueError) as error:
+            self.log.appendPlainText(f"Selection failed: {error}")
+            return
+        if not mods:
+            self.log.appendPlainText("Selection failed: no bundled mods were discovered.")
+            return
+        if not self._show_mod_selection_dialog(mods, active_mod_ids):
+            self.log.appendPlainText("Bundled mod selection was cancelled.")
+
     def scan_sources(self) -> None:
         self.log.clear()
         try:
             mods = discover_mods(self.source_paths())
-            issues = validate_mods(mods)
-        except OSError as error:
+            issues = validate_mods(mods, self.active_mod_id_overrides())
+        except (OSError, ValueError) as error:
             self.log.appendPlainText(f"Scan failed: {error}")
             return
         self.log.appendPlainText(f"Discovered {len(mods)} mod folder(s).")
@@ -792,6 +1386,15 @@ class ModpackWindow(QMainWindow):
                 )
         for issue in issues:
             self.log.appendPlainText(f"{issue.severity.upper()}: {issue.message}")
+        if any(issue.code == "bundled_incompatibility" for issue in issues):
+            self.log.appendPlainText(
+                "Use 'Select bundled mods...' to choose compatible alternatives."
+            )
+        if any(issue.code == "missing_required_mod" for issue in issues):
+            self.log.appendPlainText(
+                "Add the missing required Workshop items or source folders before "
+                "building."
+            )
 
     def _set_build_running(self, running: bool) -> None:
         self.build_button.setEnabled(not running)
@@ -846,6 +1449,37 @@ class ModpackWindow(QMainWindow):
             self.log.appendPlainText("Build failed: add at least one source folder.")
             return
         try:
+            discovered_mods = discover_mods(self.source_paths())
+            active_mod_ids = self.active_mod_id_overrides()
+            selected_mods = select_mods(discovered_mods, self.included_mod_ids)
+            selected_conflicts = find_bundled_conflicts(selected_mods)
+            selection_issues = validate_mod_selection(
+                discovered_mods,
+                selected_mods,
+                active_mod_ids,
+            )
+            requirement_issues = [
+                issue
+                for issue in selection_issues
+                if issue.code in {"excluded_required_mod", "missing_required_mod"}
+            ]
+            if not selected_mods or selected_conflicts or requirement_issues:
+                if selected_conflicts:
+                    self.log.appendPlainText(
+                        f"Choose bundled variants to resolve "
+                        f"{len(selected_conflicts)} incompatibility conflict(s)."
+                    )
+                if requirement_issues:
+                    self.log.appendPlainText(
+                        f"Review {len(requirement_issues)} required-mod issue(s) before "
+                        "building."
+                    )
+                if not self._show_mod_selection_dialog(
+                    discovered_mods,
+                    active_mod_ids,
+                ):
+                    self.log.appendPlainText("Build cancelled before changing the output.")
+                    return
             config = BuildConfig(
                 name=self.name_edit.text().strip(),
                 namespace=self.namespace_edit.text().strip(),
@@ -859,7 +1493,8 @@ class ModpackWindow(QMainWindow):
                     else None
                 ),
                 visibility=int(self.visibility_combo.currentData()),
-                active_mod_ids=self.active_mod_id_overrides(),
+                active_mod_ids=active_mod_ids,
+                included_mod_ids=self.included_mod_ids,
             )
         except (OSError, ValueError) as error:
             self.log.appendPlainText(f"Build failed: {error}")

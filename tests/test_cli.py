@@ -64,6 +64,8 @@ class CliTests(unittest.TestCase):
                         "3",
                         "--active-id",
                         "Example=ExampleId",
+                        "--include-mod-id",
+                        "ExampleId",
                     ]
                 )
 
@@ -73,6 +75,10 @@ class CliTests(unittest.TestCase):
             self.assertIn("visibility=3", (destination / "workshop.txt").read_text())
             manifest = json.loads((destination / "manifest.json").read_text())
             self.assertEqual(manifest["active_mod_id_overrides"], {"Example": "ExampleId"})
+            self.assertEqual(
+                manifest["mod_selection"]["included_mod_ids"],
+                ["ExampleId"],
+            )
             self.assertIn("Built 1 mod", output.getvalue())
 
     def test_steam_install_command_uses_the_managed_installer(self) -> None:

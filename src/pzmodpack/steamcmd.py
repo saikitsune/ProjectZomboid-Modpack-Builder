@@ -4,12 +4,15 @@ import hashlib
 import io
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,9 +20,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
+from . import __version__
+
 PZ_APP_ID = "108600"
 STEAMCMD_WINDOWS_URL = "https://client-update.steamstatic.com/installer/steamcmd.zip"
 STEAMCMD_LINUX_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+PROJECT_GITHUB_URL = "https://github.com/saikitsune/ProjectZomboid-Modpack-Builder"
+WORKSHOP_ITEM_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id={}"
+WORKSHOP_DESCRIPTION_MAX_BYTES = 8000
 
 
 @dataclass(frozen=True)
@@ -315,6 +323,7 @@ class SteamCmdClient:
         script: str,
         credentials: SteamCredentials,
         timeout: int,
+        output_callback: Callable[[str], None] | None = None,
     ) -> SteamCmdResult:
         if not self.executable.is_file():
             raise FileNotFoundError(f"SteamCMD executable not found: {self.executable}")
@@ -333,30 +342,50 @@ class SteamCmdClient:
                 os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(script)
-            try:
-                completed = subprocess.run(
-                    [str(self.executable), "+runscript", str(runscript_path)],
-                    cwd=self.executable.parent,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired as error:
-                partial = error.output or ""
-                if isinstance(partial, bytes):
-                    partial = partial.decode("utf-8", "replace")
-                output = redact_secrets(
-                    partial
-                    + f"\nSteamCMD timed out after {timeout} seconds. "
-                    "It may be waiting for a Steam Guard code or completing its first-run update.",
+            if output_callback is None:
+                try:
+                    completed = subprocess.run(
+                        [str(self.executable), "+runscript", str(runscript_path)],
+                        cwd=self.executable.parent,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    partial = error.output or ""
+                    if isinstance(partial, bytes):
+                        partial = partial.decode("utf-8", "replace")
+                    output = redact_secrets(
+                        partial
+                        + f"\nSteamCMD timed out after {timeout} seconds. "
+                        "It may be waiting for a Steam Guard code or completing its "
+                        "first-run update.",
+                        credentials,
+                    )
+                    return SteamCmdResult(False, 124, output.strip())
+                return_code = completed.returncode
+                raw_output = completed.stdout or ""
+            else:
+                return_code, raw_output, timed_out = self._execute_streaming(
+                    runscript_path,
                     credentials,
+                    timeout,
+                    output_callback,
                 )
-                return SteamCmdResult(False, 124, output.strip())
+                if timed_out:
+                    output = redact_secrets(
+                        raw_output
+                        + f"\nSteamCMD timed out after {timeout} seconds. "
+                        "It may be waiting for a Steam Guard code or completing its "
+                        "first-run update.",
+                        credentials,
+                    )
+                    return SteamCmdResult(False, 124, output.strip())
         finally:
             runscript_path.unlink(missing_ok=True)
-        output = redact_secrets(completed.stdout or "", credentials)
+        output = redact_secrets(raw_output, credentials)
         failure_patterns = (
             r"Invalid Password",
             r"Login Failure",
@@ -364,11 +393,83 @@ class SteamCmdClient:
             r"ERROR!",
             r"(?:^|\n)\s*FAILED(?:\s*\(|\s*:)",
         )
-        success = completed.returncode == 0 and not any(
+        success = return_code == 0 and not any(
             re.search(pattern, output, re.IGNORECASE)
             for pattern in failure_patterns
         )
-        return SteamCmdResult(success, completed.returncode, output)
+        return SteamCmdResult(success, return_code, output)
+
+    def _execute_streaming(
+        self,
+        runscript_path: Path,
+        credentials: SteamCredentials,
+        timeout: int,
+        output_callback: Callable[[str], None],
+    ) -> tuple[int, str, bool]:
+        process = subprocess.Popen(
+            [str(self.executable), "+runscript", str(runscript_path)],
+            cwd=self.executable.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        if process.stdout is None:
+            process.kill()
+            process.wait()
+            raise OSError("SteamCMD output stream was not available")
+
+        output_queue: queue.Queue[str | None] = queue.Queue()
+
+        def read_output() -> None:
+            try:
+                for line in process.stdout:
+                    output_queue.put(line)
+            finally:
+                output_queue.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + timeout
+        output_parts: list[str] = []
+        timed_out = False
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    process.kill()
+                    break
+                try:
+                    line = output_queue.get(timeout=min(0.2, remaining))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
+                output_parts.append(line)
+                output_callback(redact_secrets(line.rstrip("\r\n"), credentials))
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            reader.join(timeout=1)
+            raise
+
+        if timed_out:
+            return_code = process.wait()
+        else:
+            try:
+                return_code = process.wait(timeout=max(deadline - time.monotonic(), 0))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.kill()
+                return_code = process.wait()
+        reader.join(timeout=1)
+        while not output_queue.empty():
+            line = output_queue.get_nowait()
+            if line is not None:
+                output_parts.append(line)
+        return return_code, "".join(output_parts), timed_out
 
     def test_login(
         self,
@@ -391,11 +492,17 @@ class SteamCmdClient:
         workshop_ids: tuple[str, ...],
         credentials: SteamCredentials,
         timeout: int = 1800,
+        output_callback: Callable[[str], None] | None = None,
     ) -> SteamCmdResult:
         if not workshop_ids:
             raise ValueError("At least one Workshop ID is required")
         script = build_command_script(workshop_ids, credentials, self.library_root)
-        return self._execute_script(script, credentials, timeout)
+        return self._execute_script(
+            script,
+            credentials,
+            timeout,
+            output_callback=output_callback,
+        )
 
     def upload(
         self,
@@ -423,21 +530,157 @@ class DownloadBatchResult:
     snapshots: tuple[WorkshopSnapshot, ...]
 
 
+class _WorkshopDownloadProgress:
+    def __init__(
+        self,
+        workshop_ids: tuple[str, ...],
+        callback: Callable[[int, int, str], None],
+    ) -> None:
+        self.workshop_ids = workshop_ids
+        self.callback = callback
+        self.completed: set[str] = set()
+        self.current_id: str | None = None
+
+    def _next_pending(self) -> str | None:
+        return next(
+            (item for item in self.workshop_ids if item not in self.completed),
+            None,
+        )
+
+    def _position(self, workshop_id: str) -> int:
+        return self.workshop_ids.index(workshop_id) + 1
+
+    def _download_progress(self, fraction: float = 0.0) -> int:
+        completed = min(len(self.completed) + fraction, len(self.workshop_ids))
+        return int(85 * completed / len(self.workshop_ids))
+
+    def feed(self, line: str) -> None:
+        command = re.search(
+            rf"(?:workshop_download_item\s+{PZ_APP_ID}\s+|"
+            r"downloading\s+(?:Workshop\s+)?item\s+)(\d+)",
+            line,
+            re.IGNORECASE,
+        )
+        if command and command.group(1) in self.workshop_ids:
+            self.current_id = command.group(1)
+            self.callback(
+                self._download_progress(),
+                100,
+                f"Downloading Workshop item {self._position(self.current_id)}/"
+                f"{len(self.workshop_ids)} ({self.current_id})...",
+            )
+
+        success = re.search(
+            r"Success\.\s+(?:Downloaded|Updated)\s+item\s+(\d+)",
+            line,
+            re.IGNORECASE,
+        )
+        if success and success.group(1) in self.workshop_ids:
+            completed_id = success.group(1)
+            self.completed.add(completed_id)
+            self.current_id = self._next_pending()
+            self.callback(
+                self._download_progress(),
+                100,
+                f"Downloaded {len(self.completed)}/{len(self.workshop_ids)} Workshop "
+                f"items (finished {completed_id}).",
+            )
+            return
+
+        progress_match = re.search(
+            r"progress:\s*(\d+(?:\.\d+)?)",
+            line,
+            re.IGNORECASE,
+        )
+        if progress_match and self.current_id is not None:
+            item_progress = min(max(float(progress_match.group(1)), 0.0), 100.0)
+            self.callback(
+                self._download_progress(item_progress / 100),
+                100,
+                f"Downloading Workshop item {self._position(self.current_id)}/"
+                f"{len(self.workshop_ids)} ({self.current_id}): "
+                f"{item_progress:.0f}%",
+            )
+            return
+
+        activity = line.strip()
+        if activity and any(
+            token in activity.lower()
+            for token in ("logging in", "waiting for", "checking for", "downloading")
+        ):
+            self.callback(
+                self._download_progress(),
+                100,
+                f"SteamCMD: {activity[:180]}",
+            )
+
+    def finish(self) -> None:
+        self.completed.update(self.workshop_ids)
+        self.current_id = None
+        self.callback(
+            85,
+            100,
+            f"Downloaded {len(self.workshop_ids)}/{len(self.workshop_ids)} Workshop "
+            "items. Creating immutable snapshots...",
+        )
+
+
 def download_and_snapshot(
     client: SteamCmdClient,
     workshop_ids: tuple[str, ...],
     credentials: SteamCredentials,
     snapshot_root: Path,
     timeout: int = 1800,
+    progress: Callable[[int, int, str], None] | None = None,
 ) -> DownloadBatchResult:
-    command_result = client.download(workshop_ids, credentials, timeout)
-    if not command_result.success:
-        return DownloadBatchResult(command_result, ())
-    snapshots = tuple(
-        create_snapshot(client.downloaded_item_path(workshop_id), snapshot_root, workshop_id)
-        for workshop_id in workshop_ids
+    tracker = (
+        _WorkshopDownloadProgress(workshop_ids, progress)
+        if progress is not None
+        else None
     )
-    return DownloadBatchResult(command_result, snapshots)
+    if tracker is not None:
+        progress(
+            0,
+            100,
+            f"Starting SteamCMD download for {len(workshop_ids)} Workshop item(s)...",
+        )
+        command_result = client.download(
+            workshop_ids,
+            credentials,
+            timeout,
+            output_callback=tracker.feed,
+        )
+    else:
+        command_result = client.download(workshop_ids, credentials, timeout)
+    if not command_result.success:
+        if progress is not None:
+            progress(0, 100, "SteamCMD download failed; review the output log.")
+        return DownloadBatchResult(command_result, ())
+    if tracker is not None:
+        tracker.finish()
+    snapshots: list[WorkshopSnapshot] = []
+    for index, workshop_id in enumerate(workshop_ids, start=1):
+        if progress is not None:
+            progress(
+                85 + int(15 * (index - 1) / len(workshop_ids)),
+                100,
+                f"Snapshotting Workshop item {index}/{len(workshop_ids)} "
+                f"({workshop_id})...",
+            )
+        snapshots.append(
+            create_snapshot(
+                client.downloaded_item_path(workshop_id),
+                snapshot_root,
+                workshop_id,
+            )
+        )
+        if progress is not None:
+            progress(
+                85 + int(15 * index / len(workshop_ids)),
+                100,
+                f"Snapshot complete {index}/{len(workshop_ids)} ({workshop_id}).",
+            )
+    return DownloadBatchResult(command_result, tuple(snapshots))
 
 
 @dataclass(frozen=True)
@@ -471,6 +714,73 @@ def _replace_setting(path: Path, prefix: str, value: str) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _workshop_label(value: object, workshop_id: str) -> str:
+    label = re.sub(r"\s+", " ", str(value or "")).strip()
+    label = label.replace("[", "(").replace("]", ")")
+    return label or f"Workshop item {workshop_id}"
+
+
+def build_workshop_description(
+    manifest: dict[str, object],
+    program_version: str = __version__,
+) -> str:
+    """Append reproducible builder attribution and bundled-mod Workshop links."""
+    base_description = str(
+        manifest.get("description", "Built with PZ Modpack Builder")
+    ).rstrip()
+    footer = [
+        "Modpack made with "
+        f"[url={PROJECT_GITHUB_URL}]ProjectZomboid Modpack Builder[/url] "
+        f"Version: {program_version}"
+    ]
+
+    bundled_links: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    mods = manifest.get("mods", [])
+    if isinstance(mods, list):
+        for mod in mods:
+            if not isinstance(mod, dict):
+                continue
+            workshop_id = str(mod.get("source_workshop_id") or "").strip()
+            if not re.fullmatch(r"\d+", workshop_id) or workshop_id == "0":
+                continue
+            label = _workshop_label(
+                mod.get("display_name") or mod.get("source_folder"),
+                workshop_id,
+            )
+            key = (workshop_id, label)
+            if key in seen:
+                continue
+            seen.add(key)
+            bundled_links.append((label, workshop_id))
+
+    if bundled_links:
+        footer.extend(("", "Bundled Workshop mods:"))
+        for label, workshop_id in sorted(
+            bundled_links,
+            key=lambda item: (item[0].casefold(), item[1]),
+        ):
+            footer.append(
+                f"[url={WORKSHOP_ITEM_URL.format(workshop_id)}]"
+                f"{label} (Workshop ID: {workshop_id})[/url]"
+            )
+
+    footer_text = "\n".join(footer)
+    description = (
+        f"{base_description}\n\n{footer_text}" if base_description else footer_text
+    )
+    description_size = len(description.encode("utf-8"))
+    if description_size > WORKSHOP_DESCRIPTION_MAX_BYTES:
+        raise ValueError(
+            "Generated Workshop description is "
+            f"{description_size} bytes, exceeding Steam's "
+            f"{WORKSHOP_DESCRIPTION_MAX_BYTES}-byte limit. Shorten the pack "
+            "description or bundled-mod display names; attribution links were not "
+            "silently removed."
+        )
+    return description
+
+
 def upload_modpack(
     client: SteamCmdClient,
     build_output: Path,
@@ -493,7 +803,7 @@ def upload_modpack(
         preview_file=build_output / "preview.png",
         visibility=int(manifest.get("visibility", 2)),
         title=str(manifest.get("name", "Project Zomboid Modpack")),
-        description=str(manifest.get("description", "Built with PZ Modpack Builder")),
+        description=build_workshop_description(manifest),
         change_note=change_note,
     )
     vdf_path = write_upload_vdf(build_output / "workshop_upload.vdf", config)

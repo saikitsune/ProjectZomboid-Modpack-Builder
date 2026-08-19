@@ -27,7 +27,9 @@ CraftableMilitaryFences -> SaiPack_CraftableMilitaryFences
 - Saved sessions retain only the username and SteamCMD/library paths, never passwords or Guard codes
 - Workshop URL and raw-ID parsing
 - Batch Project Zomboid Workshop downloads using app ID `108600`
+- Live Workshop download progress with SteamCMD activity, per-item percentages, and snapshot status
 - SteamCMD Workshop creation and updates from generated packs
+- Automatic Workshop description attribution with builder and bundled-mod links
 - Cached account login support for uploads without reentering a password
 - Safe upload VDF generation and automatic capture of newly published Workshop IDs
 - Content-addressed immutable snapshots
@@ -38,12 +40,15 @@ CraftableMilitaryFences -> SaiPack_CraftableMilitaryFences
 - Fail-closed compatibility patches for known mod-file, script, and runtime-ID contexts
 - Exact Build 42 layout fixes for reviewed legacy folders and server-only Lua modules
 - Build 42 preflight rejection of unrecognized root-only active mods
-- Applied compatibility patches and occurrence-level categorized unresolved references recorded in `manifest.json`
+- Validated dependency relationships, applied compatibility patches, and occurrence-level categorized unresolved references recorded in `manifest.json`
 - Automatic original-ID incompatibility guards
 - Dependency ordering and cycle detection
 - Duplicate Mod ID detection
-- Explicit bundled incompatibility blocking
-- External dependency warnings
+- Interactive bundled-mod selection with metadata conflict enforcement
+- Explicit bundled incompatibility blocking after selection
+- Required-mod provider discovery from the active `mod.info`
+- Recursive auto-selection and locking of available required bundled mods
+- Missing or excluded required-mod blocking with actionable source guidance
 - Hard-coded original Mod ID scans in Lua and other text files
 - SHA-256 source manifests
 - Safe generated-output replacement using an ownership marker
@@ -82,14 +87,21 @@ Valve's Linux SteamCMD bootstrap starts a 32-bit binary. A 64-bit Linux installa
 6. Open **Build pack** and scan the resulting sources.
 7. Review errors and warnings.
 8. Enter a stable namespace, select the active B41/B42 IDs, choose a preview, and set visibility.
-9. Build the pack.
-10. Review `manifest.json`, `amp-config.txt`, and hard-coded-ID warnings.
-11. Switch to an authenticated Steam account and test the login.
-12. Open **Workshop upload**, enter the change note, confirm redistribution permission, and upload.
+9. Click **Select bundled mods...** to include or exclude optional variants. The build also opens this dialog automatically when selected folders conflict or have an unsatisfied requirement.
+10. Resolve every highlighted conflict or missing dependency and build the pack.
+11. Review `manifest.json`, `amp-config.txt`, and hard-coded-ID warnings.
+12. Switch to an authenticated Steam account and test the login.
+13. Open **Workshop upload**, enter the change note, confirm redistribution permission, and upload.
+
+Bundled choices operate on mod folders. Patch-level directories such as `42.19` and `42.20` inside `WaterPipes` remain together, while a separate folder such as `WaterPipesRemoved` can be excluded. The dialog shows the name, active Mod ID, all declared IDs, requirements, Workshop source, description, and incompatibilities for each folder. Selecting a mod recursively checks required providers already present in the downloaded source list, and a provider cannot be unchecked while a selected mod depends on it. A missing provider is labeled `[MISSING]` with the exact required Mod ID so its Workshop item or source can be added. Confirmation and builds remain blocked until requirements and conflicts are resolved.
 
 Workshop ID `0` creates a new item. After a successful creation, SteamCMD updates the VDF and the builder writes the new ID into `manifest.json`, `workshop.txt`, `amp-config.txt`, and the GUI field. An existing Workshop ID updates that item instead.
 
+At upload time, the builder appends a Steam BBCode footer to the user-entered description. It links this project with the uploading program version and lists every included mod folder that has a recorded source Workshop ID. The footer is regenerated from `manifest.json` for each upload, so updating the same Workshop item does not duplicate it. Local sources without a Workshop ID are omitted. Upload preflight reports an actionable error instead of silently dropping attribution when the generated description would exceed Steam's 8,000-byte limit.
+
 The program never automatically replaces a locked snapshot when an upstream item changes. Downloading again creates or reuses a snapshot based on the content hash.
+
+During a batch download, the Workshop tab shows the current item, SteamCMD's item percentage when available, completed-item count, and immutable-snapshot progress. The overall bar reserves its final stage for hashing and snapshotting the downloaded files.
 
 ## Steam login security
 
@@ -168,10 +180,13 @@ uv run pzmodpack build \
   --workshop-id 1234567890 \
   --preview ./preview.png \
   --visibility 2 \
-  --active-id Furry=FurryModB42
+  --active-id Furry=FurryModB42 \
+  --include-mod-id FurryModB42
 ```
 
 An active-ID override selects the version-specific ID written to AMP. Dependency references to alternate IDs from the same source folder are also redirected to the selected packed ID, so Build 42 dependents do not accidentally require the bundled Build 41 alias.
+
+Repeat `--include-mod-id` to select multiple bundled folders. A folder is included when it declares any selected ID; all of that folder's game-version directories are copied together. Omitting the option preserves the default of including every discovered folder, and validation still blocks incompatible selections.
 
 Upload using a cached SteamCMD account session:
 
@@ -234,7 +249,7 @@ Known layout and script fixes are equally strict: they run only for an exact sou
 
 ## Project files
 
-GUI projects use the suffix `.pzpack.json` and store paths, Workshop IDs, pack metadata, source selections, preview/visibility, and active Mod ID overrides. They do not store Steam usernames, passwords, or Steam Guard codes.
+GUI projects use the suffix `.pzpack.json` and store paths, Workshop IDs, pack metadata, source and bundled-mod selections, preview/visibility, and active Mod ID overrides. They do not store Steam usernames, passwords, or Steam Guard codes. `manifest.json` records both included Mod IDs and excluded source folders so every build's choice can be audited.
 
 ## Redistribution and permissions
 

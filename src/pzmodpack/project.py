@@ -20,6 +20,7 @@ class ProjectSettings:
     preview: Path | None = None
     visibility: int = 2
     active_mod_ids: dict[str, str] = field(default_factory=dict)
+    included_mod_ids: tuple[str, ...] | None = None
 
 
 def save_project(path: Path, settings: ProjectSettings) -> None:
@@ -34,6 +35,11 @@ def save_project(path: Path, settings: ProjectSettings) -> None:
     payload["workshop_items"] = list(settings.workshop_items)
     payload["preview"] = str(settings.preview) if settings.preview is not None else None
     payload["visibility"] = settings.visibility
+    payload["included_mod_ids"] = (
+        list(settings.included_mod_ids)
+        if settings.included_mod_ids is not None
+        else None
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -64,4 +70,9 @@ def load_project(path: Path) -> ProjectSettings:
             str(folder): str(mod_id)
             for folder, mod_id in payload.get("active_mod_ids", {}).items()
         },
+        included_mod_ids=(
+            tuple(str(mod_id) for mod_id in payload["included_mod_ids"])
+            if payload.get("included_mod_ids") is not None
+            else None
+        ),
     )

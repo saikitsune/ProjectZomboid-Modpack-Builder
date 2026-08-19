@@ -43,6 +43,16 @@ def _parser() -> argparse.ArgumentParser:
         metavar="FOLDER=MODID",
         help="Select the active ID for a versioned mod folder",
     )
+    build.add_argument(
+        "--include-mod-id",
+        action="append",
+        default=None,
+        metavar="MODID",
+        help=(
+            "Include only mod folders declaring one of these IDs; repeat for multiple "
+            "bundled mods"
+        ),
+    )
 
     steam_install = commands.add_parser("steam-install", help="Install SteamCMD from Valve")
     steam_install.add_argument("--destination", required=True, type=Path)
@@ -136,6 +146,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     preview=args.preview,
                     visibility=args.visibility,
                     active_mod_ids=_active_overrides(args.active_id),
+                    included_mod_ids=(
+                        tuple(args.include_mod_id)
+                        if args.include_mod_id is not None
+                        else None
+                    ),
                 )
             )
         except (BuildError, ValueError) as error:

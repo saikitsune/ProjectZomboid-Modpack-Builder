@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -15,6 +16,7 @@ from pzmodpack.steamcmd import (
     WorkshopUploadConfig,
     _vdf_escape,
     build_command_script,
+    build_workshop_description,
     build_upload_script,
     create_snapshot,
     download_and_snapshot,
@@ -89,6 +91,62 @@ class LoginScriptTests(unittest.TestCase):
 
 
 class UploadConfigTests(unittest.TestCase):
+    def test_builds_attributed_description_with_every_bundled_workshop_mod(self) -> None:
+        manifest: dict[str, object] = {
+            "description": "Curated server pack",
+            "mods": [
+                {
+                    "display_name": "Second Mod",
+                    "source_folder": "Second",
+                    "source_workshop_id": "222",
+                },
+                {
+                    "display_name": "First [Build 42] Mod",
+                    "source_folder": "First",
+                    "source_workshop_id": "111",
+                },
+                {
+                    "display_name": "Second Add-on",
+                    "source_folder": "SecondAddon",
+                    "source_workshop_id": "222",
+                },
+                {
+                    "display_name": "Local Mod",
+                    "source_folder": "Local",
+                    "source_workshop_id": None,
+                },
+            ],
+        }
+
+        description = build_workshop_description(manifest, "9.8.7")
+
+        self.assertTrue(description.startswith("Curated server pack\n\n"))
+        self.assertIn(
+            "Modpack made with "
+            "[url=https://github.com/saikitsune/ProjectZomboid-Modpack-Builder]"
+            "ProjectZomboid Modpack Builder[/url] Version: 9.8.7",
+            description,
+        )
+        self.assertIn("Bundled Workshop mods:", description)
+        self.assertIn(
+            "[url=https://steamcommunity.com/sharedfiles/filedetails/?id=111]"
+            "First (Build 42) Mod (Workshop ID: 111)[/url]",
+            description,
+        )
+        self.assertIn(
+            "[url=https://steamcommunity.com/sharedfiles/filedetails/?id=222]"
+            "Second Mod (Workshop ID: 222)[/url]",
+            description,
+        )
+        self.assertIn(
+            "[url=https://steamcommunity.com/sharedfiles/filedetails/?id=222]"
+            "Second Add-on (Workshop ID: 222)[/url]",
+            description,
+        )
+        self.assertNotIn("Local Mod", description)
+        self.assertEqual(build_workshop_description(manifest, "9.8.7"), description)
+        self.assertEqual(manifest["description"], "Curated server pack")
+
     def test_writes_project_zomboid_workshop_upload_vdf(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -120,21 +178,33 @@ class UploadConfigTests(unittest.TestCase):
             self.assertIn('"title"\t\t"Sai \\"Test\\" Pack"', text)
             self.assertIn('"changenote"\t\t"Updated mods"', text)
 
+    def test_rejects_generated_description_over_steam_byte_limit(self) -> None:
+        manifest: dict[str, object] = {"description": "x" * 8000, "mods": []}
+
+        with self.assertRaisesRegex(ValueError, "8000-byte limit"):
+            build_workshop_description(manifest, "9.8.7")
+
     def test_upload_new_item_updates_generated_pack_with_published_id(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "build"
             (output / "Contents" / "mods" / "Example").mkdir(parents=True)
             (output / "preview.png").write_bytes(b"png")
             (output / ".pzmodpack-output").write_text("generated\n", encoding="utf-8")
-            (output / "manifest.json").write_text(
-                json.dumps(
+            manifest_payload: dict[str, object] = {
+                "name": "Test Pack",
+                "description": "Description",
+                "workshop_id": "0",
+                "visibility": 2,
+                "mods": [
                     {
-                        "name": "Test Pack",
-                        "description": "Description",
-                        "workshop_id": "0",
-                        "visibility": 2,
+                        "display_name": "Example Mod",
+                        "source_folder": "Example",
+                        "source_workshop_id": "123456",
                     }
-                ),
+                ],
+            }
+            (output / "manifest.json").write_text(
+                json.dumps(manifest_payload),
                 encoding="utf-8",
             )
             (output / "workshop.txt").write_text("id=0\n", encoding="utf-8")
@@ -175,6 +245,11 @@ class UploadConfigTests(unittest.TestCase):
                 upload_vdf,
             )
             self.assertNotIn("stale", upload_vdf)
+            expected_description = build_workshop_description(manifest_payload)
+            self.assertIn(
+                f'"description"\t\t"{_vdf_escape(expected_description)}"',
+                upload_vdf,
+            )
             manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["workshop_id"], "555")
             self.assertIn("WorkshopItems=555;", (output / "amp-config.txt").read_text())
@@ -182,6 +257,92 @@ class UploadConfigTests(unittest.TestCase):
 
 
 class SteamCmdClientTests(unittest.TestCase):
+    def test_download_streams_redacted_steamcmd_output(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            executable = root / "steamcmd"
+            executable.write_text("", encoding="utf-8")
+            client = SteamCmdClient(executable, root / "library")
+            credentials = SteamCredentials(username="sai", password="secret")
+            streamed: list[str] = []
+
+            class FakeProcess:
+                def __init__(self) -> None:
+                    self.stdout = io.StringIO(
+                        "Logging in with secret\n"
+                        "workshop_download_item 108600 111 validate\n"
+                        "Update state (0x5) validating, progress: 42.50\n"
+                        'Success. Downloaded item 111 to "cache"\n'
+                    )
+                    self.returncode = 0
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return self.returncode
+
+                def kill(self) -> None:
+                    self.returncode = 1
+
+                def poll(self) -> int | None:
+                    return self.returncode
+
+            with patch("pzmodpack.steamcmd.subprocess.Popen", return_value=FakeProcess()):
+                result = client.download(
+                    ("111",),
+                    credentials,
+                    output_callback=streamed.append,
+                )
+
+            self.assertTrue(result.success)
+            self.assertTrue(any("progress: 42.50" in line for line in streamed))
+            self.assertTrue(any("Downloaded item 111" in line for line in streamed))
+            self.assertNotIn("secret", "\n".join(streamed))
+            self.assertNotIn("secret", result.output)
+
+    def test_streaming_download_still_honors_timeout(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            executable = root / "steamcmd"
+            executable.write_text("", encoding="utf-8")
+            client = SteamCmdClient(executable, root / "library")
+            stopped = threading.Event()
+
+            class BlockingOutput:
+                def __iter__(self) -> "BlockingOutput":
+                    return self
+
+                def __next__(self) -> str:
+                    stopped.wait(timeout=2)
+                    raise StopIteration
+
+            class FakeProcess:
+                def __init__(self) -> None:
+                    self.stdout = BlockingOutput()
+                    self.returncode: int | None = None
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return self.returncode or 1
+
+                def kill(self) -> None:
+                    self.returncode = 1
+                    stopped.set()
+
+                def poll(self) -> int | None:
+                    return self.returncode
+
+            with patch("pzmodpack.steamcmd.subprocess.Popen", return_value=FakeProcess()):
+                result = client.download(
+                    ("111",),
+                    SteamCredentials.anonymous(),
+                    timeout=0,
+                    output_callback=lambda _line: None,
+                )
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.return_code, 124)
+            self.assertIn("timed out after 0 seconds", result.output)
+
     def test_credentials_use_a_temporary_runscript_and_are_deleted_afterward(self) -> None:
         credentials = SteamCredentials(username="sai", password="secret", guard_code="GUARD")
         with TemporaryDirectory() as temporary_directory:
@@ -392,6 +553,65 @@ class SnapshotTests(unittest.TestCase):
             self.assertTrue(batch.command_result.success)
             self.assertEqual([item.workshop_id for item in batch.snapshots], ["111", "222"])
             self.assertTrue(all(item.path.is_dir() for item in batch.snapshots))
+
+    def test_download_batch_reports_item_percentages_and_snapshot_progress(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            executable = root / "steamcmd" / "steamcmd"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("", encoding="utf-8")
+            library = root / "library"
+            for workshop_id in ("111", "222"):
+                mod = (
+                    library
+                    / "steamapps"
+                    / "workshop"
+                    / "content"
+                    / "108600"
+                    / workshop_id
+                    / "mods"
+                    / f"Mod{workshop_id}"
+                )
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    f"id=Mod{workshop_id}\n",
+                    encoding="utf-8",
+                )
+            client = SteamCmdClient(executable, library)
+            events: list[tuple[int, int, str]] = []
+
+            def fake_download(
+                _workshop_ids: tuple[str, ...],
+                _credentials: SteamCredentials,
+                _timeout: int,
+                output_callback: object = None,
+            ) -> SteamCmdResult:
+                assert callable(output_callback)
+                output_callback("workshop_download_item 108600 111 validate")
+                output_callback("Update state (0x5), progress: 50.00")
+                output_callback("Success. Downloaded item 111 to cache")
+                output_callback("workshop_download_item 108600 222 validate")
+                output_callback("Success. Downloaded item 222 to cache")
+                return SteamCmdResult(True, 0, "Success")
+
+            with patch.object(client, "download", side_effect=fake_download):
+                batch = download_and_snapshot(
+                    client,
+                    ("111", "222"),
+                    SteamCredentials.anonymous(),
+                    root / "snapshots",
+                    progress=lambda current, total, message: events.append(
+                        (current, total, message)
+                    ),
+                )
+
+            self.assertTrue(batch.command_result.success)
+            self.assertEqual(events[0][0], 0)
+            self.assertEqual(events[-1][0], 100)
+            self.assertTrue(any("111): 50%" in event[2] for event in events))
+            self.assertTrue(any("Downloaded 2/2" in event[2] for event in events))
+            self.assertTrue(any("Snapshot complete 2/2" in event[2] for event in events))
+            self.assertEqual([event[0] for event in events], sorted(event[0] for event in events))
 
 
 if __name__ == "__main__":

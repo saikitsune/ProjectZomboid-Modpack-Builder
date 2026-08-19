@@ -8,8 +8,11 @@ from pzmodpack.backend import (
     BuildError,
     build_modpack,
     discover_mods,
+    find_bundled_conflicts,
+    find_mod_requirements,
     rewrite_mod_info,
     validate_mods,
+    validate_mod_selection,
 )
 
 
@@ -31,6 +34,7 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(discovered[0].folder_name, "ExampleMod")
             self.assertEqual(discovered[0].mod_ids, ("ExampleB41", "ExampleB42"))
             self.assertEqual(discovered[0].workshop_id, None)
+            self.assertEqual(discovered[0].display_name, "Example B42")
 
     def test_discovers_workshop_id_from_an_immutable_snapshot(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -102,9 +106,63 @@ class ValidationTests(unittest.TestCase):
 
             issues = validate_mods(discover_mods([root]))
 
-            self.assertEqual([issue.code for issue in issues], ["external_dependency"])
-            self.assertEqual(issues[0].severity, "warning")
+            self.assertEqual([issue.code for issue in issues], ["missing_required_mod"])
+            self.assertEqual(issues[0].severity, "error")
             self.assertIn("ExternalFramework", issues[0].message)
+            self.assertIn("Add its Workshop item", issues[0].message)
+
+    def test_resolves_exact_required_mod_providers(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            framework = root / "mods" / "Framework" / "42"
+            dependent = root / "mods" / "Dependent" / "42"
+            framework.mkdir(parents=True)
+            dependent.mkdir(parents=True)
+            (framework / "mod.info").write_text(
+                "name=Framework\nid=FrameworkId\n",
+                encoding="utf-8",
+            )
+            (dependent / "mod.info").write_text(
+                "name=Dependent\nid=DependentId\nrequire=FrameworkId,MissingId\n",
+                encoding="utf-8",
+            )
+
+            mods = discover_mods([root])
+            requirements = find_mod_requirements(mods)
+
+            self.assertEqual(len(requirements), 2)
+            framework_requirement = next(
+                item for item in requirements if item.required_mod_id == "FrameworkId"
+            )
+            missing_requirement = next(
+                item for item in requirements if item.required_mod_id == "MissingId"
+            )
+            self.assertEqual(framework_requirement.declaring_mod_id, "DependentId")
+            self.assertEqual(framework_requirement.providers[0].folder_name, "Framework")
+            self.assertTrue(missing_requirement.is_missing)
+
+    def test_reports_available_but_excluded_required_mod(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            framework = root / "mods" / "Framework" / "42"
+            dependent = root / "mods" / "Dependent" / "42"
+            framework.mkdir(parents=True)
+            dependent.mkdir(parents=True)
+            (framework / "mod.info").write_text(
+                "id=FrameworkId\n",
+                encoding="utf-8",
+            )
+            (dependent / "mod.info").write_text(
+                "id=DependentId\nrequire=FrameworkId\n",
+                encoding="utf-8",
+            )
+            mods = discover_mods([root])
+            selected = [mod for mod in mods if mod.folder_name == "Dependent"]
+
+            issues = validate_mod_selection(mods, selected)
+
+            self.assertEqual([issue.code for issue in issues], ["excluded_required_mod"])
+            self.assertIn("Framework", issues[0].message)
 
     def test_blocks_explicit_incompatibilities_inside_the_bundle(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -130,8 +188,78 @@ class ValidationTests(unittest.TestCase):
             self.assertIn("FirstId", conflicts[0].message)
             self.assertIn("SecondId", conflicts[0].message)
 
+    def test_conflicts_identify_the_exact_declaring_mod_folder(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            base = root / "mods" / "BaseVariant" / "42"
+            alternate = root / "mods" / "AlternateVariant" / "42"
+            base.mkdir(parents=True)
+            alternate.mkdir(parents=True)
+            (base / "mod.info").write_text(
+                "name=Base\nid=BaseId\nincompatible=AlternateId\n",
+                encoding="utf-8",
+            )
+            (alternate / "mod.info").write_text(
+                "name=Alternate\nid=AlternateId\n",
+                encoding="utf-8",
+            )
+
+            conflicts = find_bundled_conflicts(discover_mods([root]))
+
+            self.assertEqual(len(conflicts), 1)
+            self.assertEqual(conflicts[0].declaring_mod.folder_name, "BaseVariant")
+            self.assertEqual(conflicts[0].declaring_mod_id, "BaseId")
+            self.assertEqual(conflicts[0].incompatible_mod.folder_name, "AlternateVariant")
+            self.assertEqual(conflicts[0].incompatible_mod_id, "AlternateId")
+
 
 class BuildTests(unittest.TestCase):
+    def test_build_includes_only_selected_bundled_mod_folders(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            waterpipes = source / "mods" / "WaterPipes" / "42"
+            removed = source / "mods" / "WaterPipesRemoved" / "42"
+            waterpipes.mkdir(parents=True)
+            removed.mkdir(parents=True)
+            (waterpipes / "mod.info").write_text(
+                "name=Waterpipes\nid=Waterpipes\n",
+                encoding="utf-8",
+            )
+            (removed / "mod.info").write_text(
+                "name=Waterpipes Removed\nid=WaterpipesRemoved\n"
+                "incompatible=Waterpipes\n",
+                encoding="utf-8",
+            )
+            output = root / "output"
+
+            report = build_modpack(
+                BuildConfig(
+                    name="Selected Pack",
+                    namespace="Selected",
+                    sources=(source,),
+                    output=output,
+                    included_mod_ids=("Waterpipes",),
+                )
+            )
+
+            self.assertEqual(report.mod_count, 1)
+            self.assertTrue(
+                (output / "Contents" / "mods" / "Selected_WaterPipes").is_dir()
+            )
+            self.assertFalse(
+                (output / "Contents" / "mods" / "Selected_WaterPipesRemoved").exists()
+            )
+            manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["mod_selection"]["included_mod_ids"],
+                ["Waterpipes"],
+            )
+            self.assertEqual(
+                manifest["mod_selection"]["excluded_mods"][0]["mod_ids"],
+                ["WaterpipesRemoved"],
+            )
+
     def test_builds_namespaced_pack_and_reports_hardcoded_id_references(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -190,7 +318,22 @@ class BuildTests(unittest.TestCase):
                 "Mods=SaiPack_FrameworkB42;SaiPack_Dependent;",
                 (output / "amp-config.txt").read_text(),
             )
-            self.assertTrue((output / "manifest.json").is_file())
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["requirements"],
+                [
+                    {
+                        "declaring_mod_id": "Dependent",
+                        "packed_declaring_mod_id": "SaiPack_Dependent",
+                        "packed_required_mod_id": "SaiPack_FrameworkB42",
+                        "provider_folders": ["Framework"],
+                        "required_mod_id": "FrameworkB42",
+                        "source_folder": "Dependent",
+                    }
+                ],
+            )
             check_lua = (
                 output
                 / "Contents"
@@ -212,7 +355,7 @@ class BuildTests(unittest.TestCase):
             )
             self.assertEqual(report.warnings, ())
 
-    def test_build_report_preserves_external_dependency_warnings(self) -> None:
+    def test_build_blocks_missing_required_mods(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             source = root / "source"
@@ -223,22 +366,16 @@ class BuildTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            report = build_modpack(
-                BuildConfig(
-                    name="Pack",
-                    namespace="Pack",
-                    sources=(source,),
-                    output=root / "output",
+            with self.assertRaisesRegex(BuildError, "ExternalFramework"):
+                build_modpack(
+                    BuildConfig(
+                        name="Pack",
+                        namespace="Pack",
+                        sources=(source,),
+                        output=root / "output",
+                    )
                 )
-            )
-
-            self.assertTrue(
-                any("ExternalFramework" in warning for warning in report.warnings)
-            )
-            manifest = json.loads(
-                (root / "output" / "manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["warning_details"][0]["category"], "metadata")
+            self.assertFalse((root / "output").exists())
 
     def test_internal_namespace_is_not_mislabeled_as_runtime_mod_lookup(self) -> None:
         with TemporaryDirectory() as temporary_directory:
