@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pz-modpack-builder"
+version = "0.4.1"
+description = "Build namespaced Project Zomboid Workshop modpacks"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6>=6.8,<7",
+]
+
+[project.scripts]
+pzmodpack = "pzmodpack.cli:main"
+pzmodpack-gui = "pzmodpack.gui:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pzmodpack"]
