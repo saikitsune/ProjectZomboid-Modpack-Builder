@@ -2,6 +2,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from pzmodpack.backend import (
     BuildConfig,
@@ -214,6 +215,173 @@ class ValidationTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def test_rebuild_versions_pack_archives_previous_output_and_detects_update(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            mod = source / "mods" / "Example" / "42"
+            mod.mkdir(parents=True)
+            (mod / "mod.info").write_text(
+                "name=Example Mod\nid=ExampleId\n",
+                encoding="utf-8",
+            )
+            content = mod / "media" / "data.txt"
+            content.parent.mkdir()
+            content.write_text("first\n", encoding="utf-8")
+            output = root / "ExamplePack"
+            config = BuildConfig(
+                name="Example Pack",
+                namespace="Example",
+                sources=(source,),
+                output=output,
+            )
+
+            first = build_modpack(config)
+            first_manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            content.write_text("second\n", encoding="utf-8")
+            second = build_modpack(config)
+            current_manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            archive = root / "ExamplePack.versions" / "v1.0.0"
+            archived_manifest = json.loads(
+                (archive / "manifest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(first.pack_version, "1.0.0")
+            self.assertIsNone(first.previous_pack_version)
+            self.assertIsNone(first.archived_output)
+            self.assertEqual(first_manifest["format_version"], 2)
+            self.assertEqual(first_manifest["pack_version"], "1.0.0")
+            self.assertIn("builder_version", first_manifest)
+            self.assertIn("built_at_utc", first_manifest)
+            self.assertIn("Initial modpack build", first.change_note)
+            self.assertEqual(second.pack_version, "1.0.1")
+            self.assertEqual(second.previous_pack_version, "1.0.0")
+            self.assertEqual(second.archived_output, archive)
+            self.assertEqual(current_manifest["pack_version"], "1.0.1")
+            self.assertEqual(archived_manifest["pack_version"], "1.0.0")
+            self.assertEqual(
+                current_manifest["changes"]["updated_mods"][0]["display_name"],
+                "Example Mod",
+            )
+            self.assertIn("Updated mods:\n- Example Mod", second.change_note)
+            self.assertEqual(
+                (output / "change-notes.txt").read_text(encoding="utf-8"),
+                second.change_note + "\n",
+            )
+            self.assertTrue((root / "ExamplePack.versions" / ".pzmodpack-history").is_file())
+
+    def test_rebuild_supports_minor_and_major_bumps_with_add_remove_notes(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source" / "mods"
+            first_mod = source / "First" / "42"
+            second_mod = source / "Second" / "42"
+            first_mod.mkdir(parents=True)
+            second_mod.mkdir(parents=True)
+            (first_mod / "mod.info").write_text(
+                "name=First Mod\nid=FirstId\n",
+                encoding="utf-8",
+            )
+            (second_mod / "mod.info").write_text(
+                "name=Second Mod\nid=SecondId\n",
+                encoding="utf-8",
+            )
+            output = root / "pack"
+
+            build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="Pack",
+                    sources=(source.parent,),
+                    output=output,
+                    included_mod_ids=("FirstId",),
+                )
+            )
+            minor = build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="Pack",
+                    sources=(source.parent,),
+                    output=output,
+                    included_mod_ids=("FirstId", "SecondId"),
+                    version_bump="minor",
+                )
+            )
+            major = build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="Pack",
+                    sources=(source.parent,),
+                    output=output,
+                    included_mod_ids=("SecondId",),
+                    version_bump="major",
+                )
+            )
+
+            self.assertEqual(minor.pack_version, "1.1.0")
+            self.assertIn("Added mods:\n- Second Mod", minor.change_note)
+            self.assertEqual(major.pack_version, "2.0.0")
+            self.assertIn("Removed mods:\n- First Mod", major.change_note)
+            self.assertTrue((root / "pack.versions" / "v1.1.0").is_dir())
+
+    def test_failed_rebuild_preserves_last_successful_output(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mod = root / "source" / "mods" / "Example" / "42"
+            mod.mkdir(parents=True)
+            (mod / "mod.info").write_text("id=ExampleId\n", encoding="utf-8")
+            output = root / "pack"
+            config = BuildConfig(
+                name="Pack",
+                namespace="Pack",
+                sources=(root / "source",),
+                output=output,
+            )
+            build_modpack(config)
+
+            with (
+                patch(
+                    "pzmodpack.backend._rewrite_known_id_checks",
+                    side_effect=OSError("simulated build failure"),
+                ),
+                self.assertRaisesRegex(OSError, "simulated build failure"),
+            ):
+                build_modpack(config)
+
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["pack_version"], "1.0.0")
+            self.assertFalse((root / "pack.versions").exists())
+            self.assertFalse((root / ".pack.pzmodpack-building").exists())
+
+    def test_build_refuses_to_reset_version_when_only_history_remains(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mod = root / "source" / "mods" / "Example" / "42"
+            mod.mkdir(parents=True)
+            (mod / "mod.info").write_text("id=ExampleId\n", encoding="utf-8")
+            history = root / "pack.versions"
+            history.mkdir()
+            (history / ".pzmodpack-history").write_text(
+                "generated version history\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(BuildError, "current output is missing"):
+                build_modpack(
+                    BuildConfig(
+                        name="Pack",
+                        namespace="Pack",
+                        sources=(root / "source",),
+                        output=root / "pack",
+                    )
+                )
+
     def test_build_includes_only_selected_bundled_mod_folders(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

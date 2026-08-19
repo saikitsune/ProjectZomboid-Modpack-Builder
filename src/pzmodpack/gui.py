@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -30,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__
+from .version import __version__
 from .backend import (
     BuildConfig,
     BuildError,
@@ -597,6 +598,17 @@ class ModpackWindow(QMainWindow):
         self.visibility_combo.addItem("Private", 2)
         self.visibility_combo.addItem("Unlisted", 3)
         self.visibility_combo.setCurrentIndex(2)
+        self.version_bump_combo = QComboBox()
+        self.version_bump_combo.addItem("Patch (1.0.0 -> 1.0.1)", "patch")
+        self.version_bump_combo.addItem("Minor (1.0.0 -> 1.1.0)", "minor")
+        self.version_bump_combo.addItem("Major (1.0.0 -> 2.0.0)", "major")
+        self.version_status_label = QLabel()
+        self.version_status_label.setWordWrap(True)
+        self.output_edit.textChanged.connect(self._update_version_summary)
+        self.version_bump_combo.currentIndexChanged.connect(
+            self._update_version_summary
+        )
+        self._update_version_summary()
         self.active_ids_edit = QPlainTextEdit()
         self.active_ids_edit.setMaximumHeight(70)
         self.active_ids_edit.setPlaceholderText(
@@ -711,6 +723,8 @@ class ModpackWindow(QMainWindow):
         preview_row.addWidget(browse_preview)
         form.addRow("Workshop preview", preview_row)
         form.addRow("Workshop visibility", self.visibility_combo)
+        form.addRow("Version bump on rebuild", self.version_bump_combo)
+        form.addRow("Version status", self.version_status_label)
         form.addRow("Active ID overrides", self.active_ids_edit)
         bundled_mod_row = QHBoxLayout()
         self.mod_selection_label = QLabel("All discovered bundled mods")
@@ -888,6 +902,52 @@ class ModpackWindow(QMainWindow):
             overrides[folder.strip()] = mod_id.strip()
         return overrides
 
+    def _update_version_summary(self, *_args: object) -> None:
+        output_text = self.output_edit.text().strip()
+        bump = str(self.version_bump_combo.currentData() or "patch")
+        if not output_text:
+            self.version_status_label.setText("Choose an output directory.")
+            return
+        output = Path(output_text).expanduser()
+        manifest_path = output / "manifest.json"
+        try:
+            history = output.with_name(f"{output.name}.versions")
+        except ValueError:
+            self.version_status_label.setText("Choose a named output directory.")
+            return
+        archived_count = (
+            len([item for item in history.glob("v*") if item.is_dir()])
+            if history.is_dir()
+            else 0
+        )
+        if not manifest_path.is_file():
+            if history.exists():
+                self.version_status_label.setText(
+                    "Current output is missing but version history exists; restore the "
+                    "latest archived version before rebuilding."
+                )
+            else:
+                self.version_status_label.setText("First build will be v1.0.0.")
+            return
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            self.version_status_label.setText("Existing build manifest is unreadable.")
+            return
+        if not isinstance(manifest, dict):
+            self.version_status_label.setText("Existing build manifest is invalid.")
+            return
+        pack_version = str(manifest.get("pack_version") or "legacy/untracked")
+        archive_label = (
+            f"{archived_count} archived version(s)"
+            if archived_count
+            else "no archived versions yet"
+        )
+        self.version_status_label.setText(
+            f"Current: v{pack_version}; next rebuild uses a {bump} bump; "
+            f"{archive_label}."
+        )
+
     def project_settings(self) -> ProjectSettings:
         workshop_items = parse_workshop_ids(self.workshop_input.toPlainText().splitlines())
         return ProjectSettings(
@@ -909,6 +969,7 @@ class ModpackWindow(QMainWindow):
             visibility=int(self.visibility_combo.currentData()),
             active_mod_ids=self.active_mod_id_overrides(),
             included_mod_ids=self.included_mod_ids,
+            version_bump=str(self.version_bump_combo.currentData()),
         )
 
     def save_project_to(self, path: Path) -> None:
@@ -938,6 +999,10 @@ class ModpackWindow(QMainWindow):
         for source in settings.sources:
             self.add_source_path(source)
         self.included_mod_ids = settings.included_mod_ids
+        version_bump_index = self.version_bump_combo.findData(settings.version_bump)
+        self.version_bump_combo.setCurrentIndex(
+            version_bump_index if version_bump_index >= 0 else 0
+        )
         self._update_mod_selection_label()
         self.workshop_input.setPlainText("\n".join(settings.workshop_items))
         self._clear_transient_secrets()
@@ -1411,8 +1476,18 @@ class ModpackWindow(QMainWindow):
         self.build_status.setText(message)
 
     def _display_build_report(self, report: BuildReport) -> None:
-        self.log.appendPlainText(f"Built {report.mod_count} mod(s) at {report.output}")
+        self.log.appendPlainText(
+            f"Built {report.mod_count} mod(s) as v{report.pack_version} at "
+            f"{report.output}"
+        )
+        if report.archived_output is not None:
+            self.log.appendPlainText(
+                f"Archived v{report.previous_pack_version} at {report.archived_output}"
+            )
         self.log.appendPlainText(f"Namespaced {len(report.mapping)} Mod ID(s).")
+        self.log.appendPlainText(
+            "Generated Workshop change notes and loaded them into the upload tab."
+        )
         if report.warnings:
             actionable_categories = {"metadata", "runtime_mod_lookup", "mod_file_access"}
             actionable = [
@@ -1437,6 +1512,8 @@ class ModpackWindow(QMainWindow):
 
     def _build_succeeded(self, result: object) -> None:
         self._set_build_running(False)
+        self.upload_change_edit.setPlainText(result.change_note)
+        self._update_version_summary()
         self._display_build_report(result)
 
     def _build_failed(self, message: str) -> None:
@@ -1495,6 +1572,7 @@ class ModpackWindow(QMainWindow):
                 visibility=int(self.visibility_combo.currentData()),
                 active_mod_ids=active_mod_ids,
                 included_mod_ids=self.included_mod_ids,
+                version_bump=str(self.version_bump_combo.currentData()),
             )
         except (OSError, ValueError) as error:
             self.log.appendPlainText(f"Build failed: {error}")

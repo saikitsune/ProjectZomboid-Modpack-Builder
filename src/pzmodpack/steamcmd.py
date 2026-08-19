@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
-from . import __version__
+from .version import __version__
 
 PZ_APP_ID = "108600"
 STEAMCMD_WINDOWS_URL = "https://client-update.steamstatic.com/installer/steamcmd.zip"
@@ -728,10 +728,11 @@ def build_workshop_description(
     base_description = str(
         manifest.get("description", "Built with PZ Modpack Builder")
     ).rstrip()
+    build_version = str(manifest.get("builder_version") or program_version).strip()
     footer = [
         "Modpack made with "
         f"[url={PROJECT_GITHUB_URL}]ProjectZomboid Modpack Builder[/url] "
-        f"Version: {program_version}"
+        f"Version: {build_version}"
     ]
 
     bundled_links: list[tuple[str, str]] = []
@@ -785,7 +786,7 @@ def upload_modpack(
     client: SteamCmdClient,
     build_output: Path,
     credentials: SteamCredentials,
-    change_note: str,
+    change_note: str | None = None,
     timeout: int = 1800,
 ) -> WorkshopUploadResult:
     if credentials.is_anonymous:
@@ -797,6 +798,14 @@ def upload_modpack(
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Build manifest not found: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    supplied_change_note = str(change_note or "").strip()
+    effective_change_note = supplied_change_note or str(
+        manifest.get("generated_change_note") or ""
+    ).strip()
+    if not effective_change_note:
+        raise ValueError(
+            "Workshop change note is empty; build a versioned pack or provide one"
+        )
     config = WorkshopUploadConfig(
         published_file_id=str(manifest.get("workshop_id", "0")),
         content_folder=build_output / "Contents",
@@ -804,7 +813,7 @@ def upload_modpack(
         visibility=int(manifest.get("visibility", 2)),
         title=str(manifest.get("name", "Project Zomboid Modpack")),
         description=build_workshop_description(manifest),
-        change_note=change_note,
+        change_note=effective_change_note,
     )
     vdf_path = write_upload_vdf(build_output / "workshop_upload.vdf", config)
     command_result = client.upload(vdf_path, credentials, timeout)

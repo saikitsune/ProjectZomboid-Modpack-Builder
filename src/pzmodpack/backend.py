@@ -6,7 +6,10 @@ import re
 import shutil
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+
+from .version import __version__
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,7 @@ class BuildConfig:
     visibility: int = 2
     active_mod_ids: dict[str, str] = field(default_factory=dict)
     included_mod_ids: tuple[str, ...] | None = None
+    version_bump: str = "patch"
 
 
 @dataclass(frozen=True)
@@ -159,6 +163,10 @@ class BuildReport:
     mapping: dict[str, str]
     warnings: tuple[str, ...]
     warning_details: tuple[dict[str, object], ...] = ()
+    pack_version: str = "1.0.0"
+    previous_pack_version: str | None = None
+    change_note: str = ""
+    archived_output: Path | None = None
 
 
 class BuildError(RuntimeError):
@@ -191,6 +199,311 @@ def _prepare_output(output: Path) -> None:
         shutil.rmtree(output)
     output.mkdir(parents=True)
     (output / ".pzmodpack-output").write_text("generated\n", encoding="utf-8")
+
+
+_PACK_VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_VERSION_BUMPS = {"major", "minor", "patch"}
+
+
+def _parse_pack_version(value: object, *, legacy_default: bool = False) -> tuple[int, int, int]:
+    if value is None and legacy_default:
+        return (1, 0, 0)
+    match = _PACK_VERSION_PATTERN.fullmatch(str(value or "").strip())
+    if match is None:
+        raise BuildError(
+            f"Existing pack has an invalid version {value!r}; expected MAJOR.MINOR.PATCH"
+        )
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def _format_pack_version(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def _next_pack_version(previous: object | None, bump: str) -> str:
+    normalized_bump = bump.strip().lower()
+    if normalized_bump not in _VERSION_BUMPS:
+        raise BuildError("Version bump must be major, minor, or patch")
+    if previous is None:
+        return "1.0.0"
+    major, minor, patch = _parse_pack_version(previous, legacy_default=True)
+    if normalized_bump == "major":
+        return f"{major + 1}.0.0"
+    if normalized_bump == "minor":
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def _read_existing_build_manifest(output: Path) -> dict[str, object] | None:
+    if not output.exists():
+        return None
+    if not output.is_dir() or not (output / ".pzmodpack-output").is_file():
+        raise BuildError(f"Refusing to replace unmarked output directory: {output}")
+    manifest_path = output / "manifest.json"
+    if not manifest_path.is_file():
+        raise BuildError(f"Existing generated output is missing manifest.json: {output}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise BuildError(f"Could not read the existing build manifest: {error}") from error
+    if not isinstance(manifest, dict):
+        raise BuildError("Existing build manifest must contain a JSON object")
+    _parse_pack_version(manifest.get("pack_version"), legacy_default=True)
+    return manifest
+
+
+def _history_root(output: Path) -> Path:
+    return output.with_name(f"{output.name}.versions")
+
+
+def _validate_history_destination(output: Path, previous_version: str | None) -> Path | None:
+    history = _history_root(output)
+    if previous_version is None:
+        if history.exists():
+            raise BuildError(
+                f"Version history exists but the current output is missing: {history}. "
+                "Restore the latest archived version before rebuilding."
+            )
+        return None
+    if history.exists():
+        if not history.is_dir() or not (history / ".pzmodpack-history").is_file():
+            raise BuildError(f"Refusing to use unmarked version history directory: {history}")
+    archive = history / f"v{previous_version}"
+    if archive.exists():
+        raise BuildError(
+            f"Version history already contains v{previous_version}: {archive}"
+        )
+    return archive
+
+
+def _commit_versioned_output(
+    output: Path,
+    staged_output: Path,
+    previous_version: str | None,
+) -> Path | None:
+    archive = _validate_history_destination(output, previous_version)
+    if archive is None:
+        shutil.move(str(staged_output), str(output))
+        return None
+
+    history = archive.parent
+    history.mkdir(parents=True, exist_ok=True)
+    (history / ".pzmodpack-history").write_text(
+        "generated version history\n",
+        encoding="utf-8",
+    )
+    shutil.move(str(output), str(archive))
+    try:
+        shutil.move(str(staged_output), str(output))
+    except Exception:
+        if not output.exists() and archive.exists():
+            shutil.move(str(archive), str(output))
+        raise
+    return archive
+
+
+def _manifest_mods(manifest: dict[str, object]) -> list[dict[str, object]]:
+    mods = manifest.get("mods", [])
+    if not isinstance(mods, list):
+        return []
+    return [mod for mod in mods if isinstance(mod, dict)]
+
+
+def _mod_identity(mod: dict[str, object]) -> str:
+    workshop_id = str(mod.get("source_workshop_id") or "").strip()
+    source_identity = workshop_id or str(mod.get("source") or "local").casefold()
+    folder = str(mod.get("source_folder") or mod.get("packed_folder") or "").casefold()
+    return f"{source_identity}:{folder}"
+
+
+def _mod_change_record(mod: dict[str, object]) -> dict[str, object]:
+    return {
+        "source_folder": str(mod.get("source_folder") or ""),
+        "display_name": str(
+            mod.get("display_name") or mod.get("source_folder") or "Unknown mod"
+        ),
+        "source_workshop_id": mod.get("source_workshop_id"),
+        "original_mod_ids": list(mod.get("original_mod_ids", [])),
+        "sha256": str(mod.get("sha256") or ""),
+    }
+
+
+def _active_source_mod_id(
+    manifest: dict[str, object],
+    mod: dict[str, object],
+) -> str:
+    explicit = str(mod.get("active_source_mod_id") or "").strip()
+    if explicit:
+        return explicit
+    overrides = manifest.get("active_mod_id_overrides", {})
+    folder = str(mod.get("source_folder") or "")
+    if isinstance(overrides, dict) and folder in overrides:
+        return str(overrides[folder])
+    mod_ids = mod.get("original_mod_ids", [])
+    if isinstance(mod_ids, list) and mod_ids:
+        return str(mod_ids[-1])
+    return ""
+
+
+def _detect_build_changes(
+    previous: dict[str, object] | None,
+    current: dict[str, object],
+) -> dict[str, object]:
+    if previous is None:
+        return {
+            "initial_build": True,
+            "legacy_baseline": False,
+            "added_mods": [_mod_change_record(mod) for mod in _manifest_mods(current)],
+            "removed_mods": [],
+            "updated_mods": [],
+            "active_mod_id_changes": [],
+            "settings_changes": [],
+        }
+
+    old_mods = {_mod_identity(mod): mod for mod in _manifest_mods(previous)}
+    new_mods = {_mod_identity(mod): mod for mod in _manifest_mods(current)}
+    added = [
+        _mod_change_record(new_mods[key]) for key in sorted(new_mods.keys() - old_mods.keys())
+    ]
+    removed = [
+        _mod_change_record(old_mods[key]) for key in sorted(old_mods.keys() - new_mods.keys())
+    ]
+    updated: list[dict[str, object]] = []
+    active_changes: list[dict[str, object]] = []
+    for key in sorted(old_mods.keys() & new_mods.keys()):
+        old_mod = old_mods[key]
+        new_mod = new_mods[key]
+        old_hash = str(old_mod.get("sha256") or "")
+        new_hash = str(new_mod.get("sha256") or "")
+        if old_hash != new_hash:
+            record = _mod_change_record(new_mod)
+            record["previous_sha256"] = old_hash
+            updated.append(record)
+        old_active = _active_source_mod_id(previous, old_mod)
+        new_active = _active_source_mod_id(current, new_mod)
+        if old_active != new_active:
+            active_changes.append(
+                {
+                    "source_folder": str(new_mod.get("source_folder") or ""),
+                    "display_name": str(
+                        new_mod.get("display_name")
+                        or new_mod.get("source_folder")
+                        or "Unknown mod"
+                    ),
+                    "previous_mod_id": old_active,
+                    "mod_id": new_active,
+                }
+            )
+
+    settings_changes = []
+    for key, label in (
+        ("name", "Pack name"),
+        ("namespace", "Namespace"),
+        ("description", "Description"),
+        ("visibility", "Workshop visibility"),
+    ):
+        if previous.get(key) != current.get(key):
+            settings_changes.append(
+                {
+                    "setting": key,
+                    "label": label,
+                    "previous": previous.get(key),
+                    "value": current.get(key),
+                }
+            )
+
+    previous_builder = str(previous.get("builder_version") or "").strip()
+    current_builder = str(current.get("builder_version") or "").strip()
+    return {
+        "initial_build": False,
+        "legacy_baseline": "pack_version" not in previous,
+        "added_mods": added,
+        "removed_mods": removed,
+        "updated_mods": updated,
+        "active_mod_id_changes": active_changes,
+        "settings_changes": settings_changes,
+        "builder_version_change": (
+            {"previous": previous_builder, "value": current_builder}
+            if previous_builder and previous_builder != current_builder
+            else None
+        ),
+    }
+
+
+def _change_mod_label(mod: dict[str, object]) -> str:
+    label = str(mod.get("display_name") or mod.get("source_folder") or "Unknown mod")
+    workshop_id = str(mod.get("source_workshop_id") or "").strip()
+    return f"{label} (Workshop {workshop_id})" if workshop_id else label
+
+
+def _build_change_note(
+    name: str,
+    pack_version: str,
+    changes: dict[str, object],
+) -> str:
+    lines = [f"{name} v{pack_version}"]
+    if changes.get("initial_build"):
+        added = changes.get("added_mods", [])
+        count = len(added) if isinstance(added, list) else 0
+        lines.extend(("", f"Initial modpack build with {count} bundled mod(s)."))
+        return "\n".join(lines)
+
+    if changes.get("legacy_baseline"):
+        lines.extend(("", "Version tracking enabled from the existing build."))
+
+    sections = (
+        ("Added mods", "added_mods"),
+        ("Removed mods", "removed_mods"),
+        ("Updated mods", "updated_mods"),
+    )
+    has_content_change = False
+    for heading, key in sections:
+        records = changes.get(key, [])
+        if not isinstance(records, list) or not records:
+            continue
+        has_content_change = True
+        lines.extend(("", f"{heading}:"))
+        lines.extend(f"- {_change_mod_label(record)}" for record in records)
+
+    active_changes = changes.get("active_mod_id_changes", [])
+    if isinstance(active_changes, list) and active_changes:
+        has_content_change = True
+        lines.extend(("", "Changed active mod versions:"))
+        for record in active_changes:
+            lines.append(
+                f"- {record['display_name']}: {record['previous_mod_id']} -> "
+                f"{record['mod_id']}"
+            )
+
+    settings_changes = changes.get("settings_changes", [])
+    if isinstance(settings_changes, list) and settings_changes:
+        lines.extend(("", "Changed pack settings:"))
+        for record in settings_changes:
+            if record["setting"] == "description":
+                lines.append("- Workshop description updated")
+            else:
+                lines.append(
+                    f"- {record['label']}: {record['previous']} -> {record['value']}"
+                )
+
+    builder_change = changes.get("builder_version_change")
+    if isinstance(builder_change, dict):
+        lines.extend(
+            (
+                "",
+                "Builder updated: "
+                f"{builder_change['previous']} -> {builder_change['value']}",
+            )
+        )
+
+    if len(lines) == 1 or (
+        not has_content_change
+        and not settings_changes
+        and not isinstance(builder_change, dict)
+        and not changes.get("legacy_baseline")
+    ):
+        lines.extend(("", "Rebuilt with no bundled mod content changes detected."))
+    return "\n".join(lines)
 
 
 def _rewrite_known_id_checks(
@@ -876,7 +1189,7 @@ def _emit_progress(
         callback(current, 100, message)
 
 
-def build_modpack(
+def _build_modpack(
     config: BuildConfig,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> BuildReport:
@@ -936,11 +1249,25 @@ def build_modpack(
         active_packed_id = mapping[active_source_id]
         for mod_id in mod.mod_ids:
             reference_mapping[mod_id] = active_packed_id
-    output = Path(config.output).resolve()
+    final_output = Path(config.output).resolve()
+    previous_manifest = _read_existing_build_manifest(final_output)
+    previous_version = (
+        _format_pack_version(
+            _parse_pack_version(
+                previous_manifest.get("pack_version"),
+                legacy_default=True,
+            )
+        )
+        if previous_manifest is not None
+        else None
+    )
+    pack_version = _next_pack_version(previous_version, config.version_bump)
+    _validate_history_destination(final_output, previous_version)
     preview = Path(config.preview).resolve() if config.preview is not None else None
     if preview is not None and not preview.is_file():
         raise BuildError(f"Preview image not found: {preview}")
-    _emit_progress(progress, 15, "Preparing output directory")
+    output = final_output.with_name(f".{final_output.name}.pzmodpack-building")
+    _emit_progress(progress, 15, f"Preparing modpack v{pack_version}")
     _prepare_output(output)
     if preview is not None:
         shutil.copy2(preview, output / "preview.png")
@@ -979,6 +1306,13 @@ def build_modpack(
                 "source_workshop_id": mod.workshop_id,
                 "original_mod_ids": list(mod.mod_ids),
                 "packed_mod_ids": [mapping[item] for item in mod.mod_ids],
+                "active_source_mod_id": config.active_mod_ids.get(
+                    mod.folder_name,
+                    mod.mod_ids[-1],
+                ),
+                "active_packed_mod_id": mapping[
+                    config.active_mod_ids.get(mod.folder_name, mod.mod_ids[-1])
+                ],
                 "sha256": _tree_hash(mod.mod_directory),
             }
         )
@@ -1012,8 +1346,14 @@ def build_modpack(
     hardcoded_warning_details = _hardcoded_reference_details(mods_root, mapping)
     warning_details = validation_warning_details + hardcoded_warning_details
     warnings = [str(detail["message"]) for detail in warning_details]
-    manifest = {
-        "format_version": 1,
+    manifest: dict[str, object] = {
+        "format_version": 2,
+        "pack_version": pack_version,
+        "previous_pack_version": previous_version,
+        "version_bump": config.version_bump.strip().lower(),
+        "builder_version": __version__,
+        "built_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+        "history_directory": _history_root(final_output).name,
         "name": config.name,
         "description": config.description,
         "namespace": prefix.rstrip("_"),
@@ -1041,6 +1381,10 @@ def build_modpack(
         "warning_details": warning_details,
         "warnings": warnings,
     }
+    changes = _detect_build_changes(previous_manifest, manifest)
+    change_note = _build_change_note(config.name, pack_version, changes)
+    manifest["changes"] = changes
+    manifest["generated_change_note"] = change_note
     _emit_progress(progress, 94, "Writing manifest and server configuration")
     (output / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -1064,14 +1408,50 @@ def build_modpack(
         ),
         encoding="utf-8",
     )
+    (output / "change-notes.txt").write_text(change_note + "\n", encoding="utf-8")
+    (output / ".pzmodpack-output").write_text(
+        f"generated v{pack_version}\n",
+        encoding="utf-8",
+    )
+    _emit_progress(progress, 98, f"Saving modpack v{pack_version}")
+    archived_output = _commit_versioned_output(
+        final_output,
+        output,
+        previous_version,
+    )
     _emit_progress(progress, 100, "Build complete")
     return BuildReport(
-        output=output,
+        output=final_output,
         mod_count=len(mods),
         mapping=mapping,
         warnings=tuple(warnings),
         warning_details=tuple(warning_details),
+        pack_version=pack_version,
+        previous_pack_version=previous_version,
+        change_note=change_note,
+        archived_output=archived_output,
     )
+
+
+def build_modpack(
+    config: BuildConfig,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> BuildReport:
+    """Build a versioned pack while preserving the last successful output on failure."""
+    final_output = Path(config.output).resolve()
+    staged_output = final_output.with_name(
+        f".{final_output.name}.pzmodpack-building"
+    )
+    try:
+        return _build_modpack(config, progress)
+    except Exception:
+        if (
+            final_output.exists()
+            and staged_output.is_dir()
+            and (staged_output / ".pzmodpack-output").is_file()
+        ):
+            shutil.rmtree(staged_output)
+        raise
 
 
 def _read_id(mod_info: Path) -> str | None:

@@ -21,6 +21,7 @@ class ProjectSettings:
     visibility: int = 2
     active_mod_ids: dict[str, str] = field(default_factory=dict)
     included_mod_ids: tuple[str, ...] | None = None
+    version_bump: str = "patch"
 
 
 def save_project(path: Path, settings: ProjectSettings) -> None:
@@ -75,4 +76,5 @@ def load_project(path: Path) -> ProjectSettings:
             if payload.get("included_mod_ids") is not None
             else None
         ),
+        version_bump=str(payload.get("version_bump", "patch")),
     )

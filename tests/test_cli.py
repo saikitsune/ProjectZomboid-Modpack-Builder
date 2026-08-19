@@ -80,6 +80,8 @@ class CliTests(unittest.TestCase):
                 ["ExampleId"],
             )
             self.assertIn("Built 1 mod", output.getvalue())
+            self.assertIn("v1.0.0", output.getvalue())
+            self.assertIn("Initial modpack build", output.getvalue())
 
     def test_steam_install_command_uses_the_managed_installer(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -153,8 +155,6 @@ class CliTests(unittest.TestCase):
                         "--username",
                         "sai",
                         "--cached-login",
-                        "--change-note",
-                        "Initial release",
                         "--confirm-permissions",
                     ]
                 )
@@ -163,6 +163,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(upload.call_args.args[1], (root / "build").resolve())
             self.assertEqual(upload.call_args.args[2].username, "sai")
             self.assertIsNone(upload.call_args.args[2].password)
+            self.assertIsNone(upload.call_args.args[3])
             self.assertIn("Published file ID: 555", output.getvalue())
 
 

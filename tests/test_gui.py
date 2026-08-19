@@ -37,7 +37,7 @@ class GuiTests(unittest.TestCase):
             (mod / "mod.info").write_text("name=Example\nid=ExampleId\n", encoding="utf-8")
             destination = root / "built"
             window = ModpackWindow(run_async=False, persist_session=False)
-            self.assertIn("v0.5.3", window.windowTitle())
+            self.assertIn("v0.6.0", window.windowTitle())
             window.name_edit.setText("GUI Pack")
             window.namespace_edit.setText("GuiPack")
             window.workshop_edit.setText("123")
@@ -48,6 +48,8 @@ class GuiTests(unittest.TestCase):
 
             self.assertTrue((destination / "manifest.json").is_file())
             self.assertIn("Built 1 mod", window.log.toPlainText())
+            self.assertIn("GUI Pack v1.0.0", window.upload_change_edit.toPlainText())
+            self.assertIn("Current: v1.0.0", window.version_status_label.text())
             window.close()
 
     def test_async_build_keeps_gui_responsive_and_shows_progress(self) -> None:
@@ -281,7 +283,7 @@ class GuiTests(unittest.TestCase):
             window.test_steam_login()
         log = window.log.toPlainText()
         self.assertIn("Steam login succeeded", log)
-        self.assertIn("PZ Modpack Builder v0.5.3", log)
+        self.assertIn("PZ Modpack Builder v0.6.0", log)
         self.assertNotIn("super-secret", log)
         self.assertNotIn("ABCDE", log)
         self.assertEqual(window.password_edit.text(), "")
@@ -436,6 +438,7 @@ class GuiTests(unittest.TestCase):
             preview.write_bytes(b"png")
             window.preview_edit.setText(str(preview))
             window.visibility_combo.setCurrentIndex(3)
+            window.version_bump_combo.setCurrentIndex(1)
             window.active_ids_edit.setPlainText("Example=ExampleB41")
             window.workshop_input.setPlainText("111\n222")
             window.add_source_path(source)
@@ -453,6 +456,8 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(restored.name_edit.text(), "Saved Pack")
             self.assertEqual(restored.source_paths(), (source.resolve(),))
             self.assertEqual(restored.preview_edit.text(), str(preview))
+            self.assertEqual(saved.version_bump, "minor")
+            self.assertEqual(restored.version_bump_combo.currentData(), "minor")
             self.assertEqual(restored.visibility_combo.currentData(), 3)
             self.assertEqual(restored.active_ids_edit.toPlainText(), "Example=ExampleB41")
             self.assertEqual(restored.included_mod_ids, ("ExampleB41",))

@@ -51,7 +51,11 @@ CraftableMilitaryFences -> SaiPack_CraftableMilitaryFences
 - Missing or excluded required-mod blocking with actionable source guidance
 - Hard-coded original Mod ID scans in Lua and other text files
 - SHA-256 source manifests
-- Safe generated-output replacement using an ownership marker
+- Automatic semantic modpack versions with patch, minor, and major rebuild options
+- Complete prior-build archives in a marked sibling version-history directory
+- Manifest and source-hash comparison for added, removed, updated, and reselected mods
+- Generated Workshop change notes preloaded into the upload workflow
+- Staged output replacement that preserves the current pack when a rebuild fails
 - Saveable GUI project files that exclude Steam credentials
 - AMP `WorkshopItems` and ordered `Mods` output
 
@@ -86,12 +90,12 @@ Valve's Linux SteamCMD bootstrap starts a 32-bit binary. A 64-bit Linux installa
 5. Click **Download, snapshot, and add to pack**.
 6. Open **Build pack** and scan the resulting sources.
 7. Review errors and warnings.
-8. Enter a stable namespace, select the active B41/B42 IDs, choose a preview, and set visibility.
+8. Enter a stable namespace, select the active B41/B42 IDs, choose a preview, set visibility, and choose the version bump for rebuilds.
 9. Click **Select bundled mods...** to include or exclude optional variants. The build also opens this dialog automatically when selected folders conflict or have an unsatisfied requirement.
 10. Resolve every highlighted conflict or missing dependency and build the pack.
-11. Review `manifest.json`, `amp-config.txt`, and hard-coded-ID warnings.
+11. Review `manifest.json`, `change-notes.txt`, `amp-config.txt`, and hard-coded-ID warnings.
 12. Switch to an authenticated Steam account and test the login.
-13. Open **Workshop upload**, enter the change note, confirm redistribution permission, and upload.
+13. Open **Workshop upload**, review or edit the generated change note, confirm redistribution permission, and upload.
 
 Bundled choices operate on mod folders. Patch-level directories such as `42.19` and `42.20` inside `WaterPipes` remain together, while a separate folder such as `WaterPipesRemoved` can be excluded. The dialog shows the name, active Mod ID, all declared IDs, requirements, Workshop source, description, and incompatibilities for each folder. Selecting a mod recursively checks required providers already present in the downloaded source list, and a provider cannot be unchecked while a selected mod depends on it. A missing provider is labeled `[MISSING]` with the exact required Mod ID so its Workshop item or source can be added. Confirmation and builds remain blocked until requirements and conflicts are resolved.
 
@@ -100,6 +104,14 @@ Workshop ID `0` creates a new item. After a successful creation, SteamCMD update
 At upload time, the builder appends a Steam BBCode footer to the user-entered description. It links this project with the uploading program version and lists every included mod folder that has a recorded source Workshop ID. The footer is regenerated from `manifest.json` for each upload, so updating the same Workshop item does not duplicate it. Local sources without a Workshop ID are omitted. Upload preflight reports an actionable error instead of silently dropping attribution when the generated description would exceed Steam's 8,000-byte limit.
 
 The program never automatically replaces a locked snapshot when an upstream item changes. Downloading again creates or reuses a snapshot based on the content hash.
+
+### Modpack version history
+
+The first successful build at an output path is version `1.0.0`. Rebuilding the same generated output advances the version using the selected patch, minor, or major bump. The configured output path always remains the latest upload-ready build, so saved projects and upload settings do not need to change between releases.
+
+Before the new version replaces the latest build, it is completed in a marked staging directory. The prior complete output is then moved into a marked sibling history directory such as `sai-pack.versions/v1.0.0`. A failed build leaves the last successful output untouched.
+
+Every versioned manifest records the pack version, previous version, builder version, UTC build time, active source Mod IDs, structured detected changes, and the generated Workshop change note. Comparisons use Workshop ID plus source folder identity and SHA-256 source hashes to detect added, removed, and updated bundled mods. Active-version and pack-setting changes are recorded separately. The generated note is written to `change-notes.txt` and loaded into the GUI upload tab for review.
 
 During a batch download, the Workshop tab shows the current item, SteamCMD's item percentage when available, completed-item count, and immutable-snapshot progress. The overall bar reserves its final stage for hashing and snapshotting the downloaded files.
 
@@ -180,6 +192,7 @@ uv run pzmodpack build \
   --workshop-id 1234567890 \
   --preview ./preview.png \
   --visibility 2 \
+  --version-bump patch \
   --active-id Furry=FurryModB42 \
   --include-mod-id FurryModB42
 ```
@@ -197,11 +210,10 @@ uv run pzmodpack steam-upload \
   --output ./build/sai-pack \
   --username your-steam-name \
   --cached-login \
-  --change-note "Updated bundled mods and compatibility fixes" \
   --confirm-permissions
 ```
 
-Omit `--cached-login` to receive hidden password and Steam Guard prompts. Uploads are refused unless `--confirm-permissions` is supplied.
+The upload command uses the change note generated by the latest build. Pass `--change-note "..."` to override it. Omit `--cached-login` to receive hidden password and Steam Guard prompts. Uploads are refused unless `--confirm-permissions` is supplied.
 
 ## Generated output
 
@@ -213,10 +225,15 @@ build/sai-pack/
 │       ├── SaiPack_FirstMod/
 │       └── SaiPack_SecondMod/
 ├── amp-config.txt
+├── change-notes.txt
 ├── manifest.json
 ├── preview.png
 ├── workshop.txt
 └── workshop_upload.vdf       # created when uploading
+
+build/sai-pack.versions/
+├── .pzmodpack-history
+└── v1.0.0/                    # complete prior upload-ready build
 ```
 
 `workshop.txt` defaults to visibility `2`, which is private. Publish staging builds privately and change visibility only when ready.
@@ -231,7 +248,7 @@ Build-blocking errors:
 - Invalid namespace
 - No discovered mods
 - An active root-only legacy mod in a pack whose selected IDs require Build 42
-- Attempting to overwrite a directory not created by this builder
+- Attempting to overwrite an output or version-history directory not created by this builder
 
 Warnings are categorized in `manifest.json`:
 
@@ -249,7 +266,7 @@ Known layout and script fixes are equally strict: they run only for an exact sou
 
 ## Project files
 
-GUI projects use the suffix `.pzpack.json` and store paths, Workshop IDs, pack metadata, source and bundled-mod selections, preview/visibility, and active Mod ID overrides. They do not store Steam usernames, passwords, or Steam Guard codes. `manifest.json` records both included Mod IDs and excluded source folders so every build's choice can be audited.
+GUI projects use the suffix `.pzpack.json` and store paths, Workshop IDs, pack metadata, source and bundled-mod selections, preview/visibility, version-bump preference, and active Mod ID overrides. They do not store Steam usernames, passwords, or Steam Guard codes. `manifest.json` records both included Mod IDs and excluded source folders so every build's choice and release diff can be audited.
 
 ## Redistribution and permissions
 

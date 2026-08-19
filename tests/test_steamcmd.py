@@ -91,6 +91,18 @@ class LoginScriptTests(unittest.TestCase):
 
 
 class UploadConfigTests(unittest.TestCase):
+    def test_workshop_description_uses_version_recorded_at_build_time(self) -> None:
+        manifest: dict[str, object] = {
+            "description": "Pack",
+            "builder_version": "1.2.3",
+            "mods": [],
+        }
+
+        description = build_workshop_description(manifest, "9.8.7")
+
+        self.assertIn("Version: 1.2.3", description)
+        self.assertNotIn("Version: 9.8.7", description)
+
     def test_builds_attributed_description_with_every_bundled_workshop_mod(self) -> None:
         manifest: dict[str, object] = {
             "description": "Curated server pack",
@@ -195,6 +207,7 @@ class UploadConfigTests(unittest.TestCase):
                 "description": "Description",
                 "workshop_id": "0",
                 "visibility": 2,
+                "generated_change_note": "Test Pack v1.0.0\n\nInitial build.",
                 "mods": [
                     {
                         "display_name": "Example Mod",
@@ -234,7 +247,7 @@ class UploadConfigTests(unittest.TestCase):
                     client,
                     output,
                     SteamCredentials(username="sai"),
-                    "Initial upload",
+                    "   ",
                 )
 
             self.assertTrue(result.command_result.success)
@@ -245,6 +258,10 @@ class UploadConfigTests(unittest.TestCase):
                 upload_vdf,
             )
             self.assertNotIn("stale", upload_vdf)
+            self.assertIn(
+                '"changenote"\t\t"Test Pack v1.0.0\\n\\nInitial build."',
+                upload_vdf,
+            )
             expected_description = build_workshop_description(manifest_payload)
             self.assertIn(
                 f'"description"\t\t"{_vdf_escape(expected_description)}"',
