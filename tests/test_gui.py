@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QDialogButtonBox,
+    QHeaderView,
     QLineEdit,
     QMessageBox,
     QTreeWidgetItem,
@@ -113,7 +114,7 @@ class GuiTests(unittest.TestCase):
             )
             destination = root / "built"
             window = ModpackWindow(run_async=False, persist_session=False)
-            self.assertIn("v0.8.0", window.windowTitle())
+            self.assertIn("v0.8.1", window.windowTitle())
             window.name_edit.setText("GUI Pack")
             window.namespace_edit.setText("GuiPack")
             window.workshop_edit.setText("123")
@@ -542,7 +543,7 @@ class GuiTests(unittest.TestCase):
             window.test_steam_login()
         log = window.log.toPlainText()
         self.assertIn("Steam login succeeded", log)
-        self.assertIn("PZ Modpack Builder v0.8.0", log)
+        self.assertIn("PZ Modpack Builder v0.8.1", log)
         self.assertNotIn("super-secret", log)
         self.assertNotIn("ABCDE", log)
         self.assertEqual(window.password_edit.text(), "")
@@ -823,6 +824,54 @@ class GuiTests(unittest.TestCase):
             window.snapshot_edit.setText(str(snapshot_root))
             window.refresh_managed_downloads()
 
+            header = window.manager_tree.header()
+            self.assertTrue(
+                all(
+                    header.sectionResizeMode(column)
+                    == QHeaderView.ResizeMode.Interactive
+                    for column in range(window.manager_tree.columnCount())
+                )
+            )
+            manual_widths = (181, 192, 143, 154, 165, 276)
+            for column, width in enumerate(manual_widths):
+                window.manager_tree.setColumnWidth(column, width)
+            window.refresh_managed_downloads()
+            self.assertEqual(
+                tuple(
+                    window.manager_tree.columnWidth(column)
+                    for column in range(window.manager_tree.columnCount())
+                ),
+                manual_widths,
+            )
+            current_details = WorkshopDetailsQueryResult(
+                (
+                    WorkshopPublishedFileDetails(
+                        "9",
+                        1,
+                        workshop_manifest_id="100",
+                        consumer_app_id="108600",
+                    ),
+                    WorkshopPublishedFileDetails(
+                        "100",
+                        1,
+                        workshop_manifest_id="9",
+                        consumer_app_id="108600",
+                    ),
+                )
+            )
+            with patch(
+                "pzmodpack.gui.query_workshop_item_details",
+                return_value=current_details,
+            ):
+                window.check_all_managed_workshop_updates()
+            self.assertEqual(
+                tuple(
+                    window.manager_tree.columnWidth(column)
+                    for column in range(window.manager_tree.columnCount())
+                ),
+                manual_widths,
+            )
+
             window.manager_tree.sortItems(0, Qt.SortOrder.AscendingOrder)
             self.assertEqual(
                 [
@@ -911,12 +960,28 @@ class GuiTests(unittest.TestCase):
             window.library_edit.setText(str(root / "steam-library"))
             window.snapshot_edit.setText(str(snapshot_root))
             window.refresh_managed_downloads()
+            parent_111 = _managed_parent(window, "111")
+            parent_222 = _managed_parent(window, "222")
+            self.assertFalse(parent_111.isExpanded())
+            self.assertFalse(parent_222.isExpanded())
+
+            window.manager_search_edit.setText(f"111 ANCIENT {old_hash}")
+            self.assertTrue(parent_111.isExpanded())
+            window.manager_search_edit.clear()
+            self.assertFalse(parent_111.isExpanded())
+
+            parent_111.setExpanded(True)
+            window.manager_search_edit.setText("222 unrelated")
+            self.assertTrue(parent_222.isExpanded())
+            window.manager_search_edit.clear()
+            self.assertTrue(parent_111.isExpanded())
+            self.assertFalse(parent_222.isExpanded())
+
             old = _managed_snapshot(window, "111", old_hash[:16])
             window.manager_tree.setCurrentItem(old)
             self.assertTrue(window.manager_add_button.isEnabled())
 
             window.manager_search_edit.setText(f"111 ANCIENT {old_hash}")
-            parent_111 = _managed_parent(window, "111")
             self.assertFalse(parent_111.isHidden())
             self.assertFalse(old.isHidden())
             self.assertTrue(
@@ -950,6 +1015,77 @@ class GuiTests(unittest.TestCase):
             self.assertTrue(window.manager_add_button.isEnabled())
             self.assertTrue(window.manager_delete_snapshot_button.isEnabled())
             self.assertTrue(window.manager_delete_item_button.isEnabled())
+            window.close()
+
+    def test_manager_expand_collapse_persists_and_keeps_selection_visible(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            first_hash = "a" * 64
+            for workshop_id, sha256 in (("111", first_hash), ("222", "b" * 64)):
+                _stored_snapshot_fixture(
+                    snapshot_root,
+                    workshop_id,
+                    sha256,
+                    "2026-08-19T12:00:00+00:00",
+                    manifest_id=workshop_id,
+                )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.refresh_managed_downloads()
+
+            self.assertTrue(
+                all(
+                    not _managed_parent(window, workshop_id).isExpanded()
+                    for workshop_id in ("111", "222")
+                )
+            )
+            window.manager_expand_all_button.click()
+            self.assertTrue(
+                all(
+                    _managed_parent(window, workshop_id).isExpanded()
+                    for workshop_id in ("111", "222")
+                )
+            )
+            window.refresh_managed_downloads()
+            self.assertTrue(
+                all(
+                    _managed_parent(window, workshop_id).isExpanded()
+                    for workshop_id in ("111", "222")
+                )
+            )
+
+            child = _managed_snapshot(window, "111", first_hash[:16])
+            window.manager_tree.setCurrentItem(child)
+            self.assertTrue(window.manager_add_button.isEnabled())
+            self.assertTrue(window.manager_delete_snapshot_button.isEnabled())
+            window.manager_collapse_all_button.click()
+
+            current = window.manager_tree.currentItem()
+            self.assertIsNotNone(current)
+            self.assertEqual(
+                str(current.data(0, _MANAGER_WORKSHOP_ID_ROLE)),
+                "111",
+            )
+            self.assertFalse(current.data(0, _MANAGER_REVISION_ROLE))
+            self.assertTrue(
+                all(
+                    not _managed_parent(window, workshop_id).isExpanded()
+                    for workshop_id in ("111", "222")
+                )
+            )
+            self.assertFalse(window.manager_add_button.isEnabled())
+            self.assertFalse(window.manager_delete_snapshot_button.isEnabled())
+            self.assertNotIn(first_hash, window.manager_details.toPlainText())
+
+            window.refresh_managed_downloads()
+            self.assertTrue(
+                all(
+                    not _managed_parent(window, workshop_id).isExpanded()
+                    for workshop_id in ("111", "222")
+                )
+            )
             window.close()
 
     def test_manager_check_all_assesses_manifests_and_shows_remote_details(
@@ -1056,7 +1192,26 @@ class GuiTests(unittest.TestCase):
             download.assert_not_called()
             self.assertEqual(window.source_paths(), original_sources)
             self.assertEqual(window.snapshot_selections, {"333": "d" * 64})
-            self.assertIn("Update available", _managed_parent(window, "111").text(5))
+            parent_111 = _managed_parent(window, "111")
+            expected_update = "Needs Update (Workshop 111)"
+            self.assertTrue(parent_111.text(0).startswith("UPDATE AVAILABLE"))
+            self.assertIn(expected_update, parent_111.text(0))
+            self.assertIn("Update available", parent_111.text(5))
+            self.assertTrue(parent_111.font(0).bold())
+            self.assertTrue(parent_111.font(5).bold())
+            self.assertIn(
+                expected_update,
+                window.manager_update_summary_label.text(),
+            )
+            self.assertIn(
+                f"Update available: {expected_update}",
+                window.log.toPlainText(),
+            )
+            for workshop_id in ("222", "333", "444", "555"):
+                current_parent = _managed_parent(window, workshop_id)
+                self.assertFalse(current_parent.text(0).startswith("UPDATE AVAILABLE"))
+                self.assertFalse(current_parent.font(0).bold())
+                self.assertFalse(current_parent.font(5).bold())
             self.assertIn(
                 "Current content stored in older snapshot",
                 _managed_parent(window, "222").text(5),
@@ -1083,7 +1238,6 @@ class GuiTests(unittest.TestCase):
                 "Matches current Workshop content",
                 _managed_snapshot(window, "333", current_333.name).text(5),
             )
-            parent_111 = _managed_parent(window, "111")
             self.assertIn("Needs Update", parent_111.text(0))
             window.manager_tree.setCurrentItem(parent_111)
             manager_details = window.manager_details.toPlainText()

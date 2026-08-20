@@ -807,6 +807,8 @@ class ModpackWindow(QMainWindow):
         self._manager_remote_warnings: tuple[str, ...] = ()
         self._manager_remote_checked_at_utc: str | None = None
         self._manager_remote_scope: tuple[Path, Path] | None = None
+        self._manager_expanded_workshop_ids: set[str] = set()
+        self._manager_expansion_syncing = False
         self.setWindowTitle(f"PZ Modpack Builder v{__version__}")
         self.resize(1040, 780)
         workspace = Path.home() / ".pzmodpack-builder"
@@ -1119,9 +1121,25 @@ class ModpackWindow(QMainWindow):
             self._filter_managed_downloads
         )
         search_row.addWidget(self.manager_search_edit, 1)
+        self.manager_expand_all_button = QPushButton("Expand all")
+        self.manager_expand_all_button.clicked.connect(
+            self.expand_all_managed_downloads
+        )
+        search_row.addWidget(self.manager_expand_all_button)
+        self.manager_collapse_all_button = QPushButton("Collapse all")
+        self.manager_collapse_all_button.clicked.connect(
+            self.collapse_all_managed_downloads
+        )
+        search_row.addWidget(self.manager_collapse_all_button)
         layout.addLayout(search_row)
         self.manager_filter_count_label = QLabel("No Workshop items to show.")
         layout.addWidget(self.manager_filter_count_label)
+        self.manager_update_summary_label = QLabel("Workshop updates: Not checked.")
+        self.manager_update_summary_label.setWordWrap(True)
+        self.manager_update_summary_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.manager_update_summary_label)
 
         self.manager_tree = QTreeWidget()
         self.manager_tree.setColumnCount(6)
@@ -1136,19 +1154,22 @@ class ModpackWindow(QMainWindow):
             )
         )
         manager_header = self.manager_tree.header()
-        manager_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        manager_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in range(2, 5):
+        manager_header.setStretchLastSection(False)
+        manager_header.setMinimumSectionSize(70)
+        for column in range(self.manager_tree.columnCount()):
             manager_header.setSectionResizeMode(
                 column,
-                QHeaderView.ResizeMode.ResizeToContents,
+                QHeaderView.ResizeMode.Interactive,
             )
-        manager_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        for column, width in enumerate((280, 220, 175, 175, 165, 320)):
+            self.manager_tree.setColumnWidth(column, width)
         self.manager_tree.setSortingEnabled(True)
         self.manager_tree.sortItems(3, Qt.SortOrder.DescendingOrder)
         self.manager_tree.itemSelectionChanged.connect(
             self._managed_selection_changed
         )
+        self.manager_tree.itemExpanded.connect(self._managed_item_expanded)
+        self.manager_tree.itemCollapsed.connect(self._managed_item_collapsed)
         layout.addWidget(self.manager_tree, 1)
 
         buttons = QHBoxLayout()
@@ -1534,8 +1555,56 @@ class ModpackWindow(QMainWindow):
         while current is not None:
             if current.isHidden():
                 return False
-            current = current.parent()
+            parent = current.parent()
+            if parent is not None and not parent.isExpanded():
+                return False
+            current = parent
         return True
+
+    @staticmethod
+    def _managed_parent_workshop_id(item: QTreeWidgetItem) -> str:
+        return str(item.data(0, _MANAGED_WORKSHOP_ID_ROLE) or "")
+
+    def _managed_item_expanded(self, item: QTreeWidgetItem) -> None:
+        if self._manager_expansion_syncing or item.parent() is not None:
+            return
+        workshop_id = self._managed_parent_workshop_id(item)
+        if workshop_id:
+            self._manager_expanded_workshop_ids.add(workshop_id)
+        self._managed_selection_changed()
+
+    def _managed_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        if self._manager_expansion_syncing or item.parent() is not None:
+            return
+        workshop_id = self._managed_parent_workshop_id(item)
+        if workshop_id:
+            self._manager_expanded_workshop_ids.discard(workshop_id)
+        current = self.manager_tree.currentItem()
+        if current is not None and current.parent() is item:
+            self.manager_tree.setCurrentItem(item)
+        else:
+            self._managed_selection_changed()
+
+    def expand_all_managed_downloads(self) -> None:
+        self._manager_expanded_workshop_ids = set(self._managed_item_ids)
+        self._manager_expansion_syncing = True
+        try:
+            self.manager_tree.expandAll()
+        finally:
+            self._manager_expansion_syncing = False
+        self._managed_selection_changed()
+
+    def collapse_all_managed_downloads(self) -> None:
+        current = self.manager_tree.currentItem()
+        if current is not None and current.parent() is not None:
+            self.manager_tree.setCurrentItem(current.parent())
+        self._manager_expanded_workshop_ids.clear()
+        self._manager_expansion_syncing = True
+        try:
+            self.manager_tree.collapseAll()
+        finally:
+            self._manager_expansion_syncing = False
+        self._managed_selection_changed()
 
     def _manager_selection_identity(
         self,
@@ -1676,6 +1745,78 @@ class ModpackWindow(QMainWindow):
             return "Matches current Workshop content"
         return "Different from current Workshop content"
 
+    def _managed_update_labels(
+        self,
+        workshop_ids: tuple[str, ...] | None = None,
+    ) -> tuple[str, ...]:
+        labels: list[str] = []
+        for workshop_id in workshop_ids or self._managed_item_ids:
+            assessment_code = self._manager_update_assessment(
+                workshop_id,
+                self._managed_records_for_item(workshop_id),
+            )[0]
+            if assessment_code != "update_available":
+                continue
+            remote = self._manager_remote_details.get(workshop_id)
+            title = remote.title if remote is not None else None
+            labels.append(
+                f"{title} (Workshop {workshop_id})"
+                if title
+                else f"Workshop {workshop_id}"
+            )
+        return tuple(labels)
+
+    def _update_managed_update_summary(self) -> None:
+        labels = self._managed_update_labels()
+        if labels:
+            visible = ", ".join(labels[:5])
+            if len(labels) > 5:
+                visible += (
+                    f" (+{len(labels) - 5} more; search for "
+                    '"Update available" to show them)'
+                )
+            noun = "Update" if len(labels) == 1 else "Updates"
+            self.manager_update_summary_label.setText(
+                f"{noun} available ({len(labels)}): {visible}"
+            )
+            self.manager_update_summary_label.setToolTip("\n".join(labels))
+            self.manager_update_summary_label.setStyleSheet(
+                "background: #3a2f16; border: 1px solid #f59e0b; "
+                "border-radius: 5px; padding: 7px; color: #fde68a; "
+                "font-weight: 600;"
+            )
+            return
+
+        self.manager_update_summary_label.setToolTip("")
+        self.manager_update_summary_label.setStyleSheet("")
+        if not self._managed_item_ids:
+            self.manager_update_summary_label.setText(
+                "No managed Workshop items to check."
+            )
+            return
+        if self._manager_remote_checked_at_utc is None:
+            self.manager_update_summary_label.setText(
+                "Workshop updates: Not checked."
+            )
+            return
+        attention_count = sum(
+            self._manager_update_assessment(
+                workshop_id,
+                self._managed_records_for_item(workshop_id),
+            )[0]
+            in {"unknown", "not_stored", "not_checked"}
+            for workshop_id in self._managed_item_ids
+        )
+        if attention_count:
+            self.manager_update_summary_label.setText(
+                "No updates confirmed; "
+                f"{attention_count} item(s) could not be compared or have no snapshot."
+            )
+        else:
+            self.manager_update_summary_label.setText(
+                "All comparable Workshop items are current."
+            )
+
     def _managed_item_search_text(self, item: QTreeWidgetItem) -> str:
         fields = [item.text(column) for column in range(self.manager_tree.columnCount())]
         extra = item.data(0, _MANAGED_SEARCH_ROLE)
@@ -1692,31 +1833,38 @@ class ModpackWindow(QMainWindow):
         visible_snapshots = 0
         total_items = self.manager_tree.topLevelItemCount()
         total_snapshots = 0
-        for parent_index in range(total_items):
-            parent = self.manager_tree.topLevelItem(parent_index)
-            parent_match = not tokens or all(
-                token in self._managed_item_search_text(parent) for token in tokens
-            )
-            child_matches: list[bool] = []
-            for child_index in range(parent.childCount()):
-                child = parent.child(child_index)
-                child_match = not tokens or all(
-                    token in self._managed_item_search_text(child) for token in tokens
+        self._manager_expansion_syncing = True
+        try:
+            for parent_index in range(total_items):
+                parent = self.manager_tree.topLevelItem(parent_index)
+                parent_match = not tokens or all(
+                    token in self._managed_item_search_text(parent) for token in tokens
                 )
-                child_matches.append(child_match)
-            parent_visible = parent_match or any(child_matches)
-            parent.setHidden(not parent_visible)
-            if parent_visible:
-                visible_items += 1
-                if tokens:
-                    parent.setExpanded(True)
-            for child_index, child_match in enumerate(child_matches):
-                child = parent.child(child_index)
-                child_visible = parent_visible and (parent_match or child_match)
-                child.setHidden(not child_visible)
-                total_snapshots += 1
-                if child_visible:
-                    visible_snapshots += 1
+                child_matches: list[bool] = []
+                for child_index in range(parent.childCount()):
+                    child = parent.child(child_index)
+                    child_match = not tokens or all(
+                        token in self._managed_item_search_text(child) for token in tokens
+                    )
+                    child_matches.append(child_match)
+                parent_visible = parent_match or any(child_matches)
+                parent.setHidden(not parent_visible)
+                if parent_visible:
+                    visible_items += 1
+                workshop_id = self._managed_parent_workshop_id(parent)
+                parent.setExpanded(
+                    bool(tokens and parent_visible)
+                    or workshop_id in self._manager_expanded_workshop_ids
+                )
+                for child_index, child_match in enumerate(child_matches):
+                    child = parent.child(child_index)
+                    child_visible = parent_visible and (parent_match or child_match)
+                    child.setHidden(not child_visible)
+                    total_snapshots += 1
+                    if child_visible:
+                        visible_snapshots += 1
+        finally:
+            self._manager_expansion_syncing = False
         if tokens:
             self.manager_filter_count_label.setText(
                 f"Showing {visible_items} of {total_items} Workshop item(s) and "
@@ -1780,6 +1928,12 @@ class ModpackWindow(QMainWindow):
         except (OSError, ValueError) as error:
             self.manager_summary_label.setText(f"Unsafe snapshot library setting: {error}")
             self.manager_details.clear()
+            self._manager_expanded_workshop_ids.clear()
+            self.manager_update_summary_label.setText(
+                "Workshop updates unavailable until the snapshot library is safe."
+            )
+            self.manager_update_summary_label.setToolTip("")
+            self.manager_update_summary_label.setStyleSheet("")
             self._filter_managed_downloads()
             self._update_manager_action_buttons()
             return
@@ -1790,6 +1944,12 @@ class ModpackWindow(QMainWindow):
                 f"Could not read the snapshot library: {error}"
             )
             self.manager_details.clear()
+            self._manager_expanded_workshop_ids.clear()
+            self.manager_update_summary_label.setText(
+                "Workshop updates unavailable until the snapshot library can be read."
+            )
+            self.manager_update_summary_label.setToolTip("")
+            self.manager_update_summary_label.setStyleSheet("")
             self._filter_managed_downloads()
             self._update_manager_action_buttons()
             return
@@ -1819,6 +1979,9 @@ class ModpackWindow(QMainWindow):
             grouped.setdefault(workshop_id, [])
 
         self._managed_item_ids = tuple(sorted(grouped, key=int))
+        self._manager_expanded_workshop_ids.intersection_update(
+            self._managed_item_ids
+        )
         manager_header = self.manager_tree.header()
         sort_column = self.manager_tree.sortColumn()
         sort_order = manager_header.sortIndicatorOrder()
@@ -1828,7 +1991,7 @@ class ModpackWindow(QMainWindow):
             records = grouped[workshop_id]
             latest = records[0] if records else None
             remote = self._manager_remote_details.get(workshop_id)
-            _assessment_code, assessment_label, assessment_detail = (
+            assessment_code, assessment_label, assessment_detail = (
                 self._manager_update_assessment(workshop_id, records)
             )
             cached_path = cache_items.get(workshop_id)
@@ -1860,6 +2023,8 @@ class ModpackWindow(QMainWindow):
                 if remote_title
                 else f"Workshop {workshop_id}"
             )
+            if assessment_code == "update_available":
+                parent_name = f"UPDATE AVAILABLE — {parent_name}"
             parent_updated_at = (
                 remote.workshop_updated_at_utc
                 if remote is not None and remote.workshop_updated_at_utc
@@ -1922,6 +2087,11 @@ class ModpackWindow(QMainWindow):
             )
             for column in range(6):
                 parent.setToolTip(column, parent_tooltip)
+            if assessment_code == "update_available":
+                for column in (0, 5):
+                    font = parent.font(column)
+                    font.setBold(True)
+                    parent.setFont(column, font)
             self.manager_tree.addTopLevelItem(parent)
 
             for index, record in enumerate(records):
@@ -2017,7 +2187,9 @@ class ModpackWindow(QMainWindow):
                     selected_item = child
             if previous_selection == (workshop_id, None):
                 selected_item = parent
-            parent.setExpanded(True)
+            parent.setExpanded(
+                workshop_id in self._manager_expanded_workshop_ids
+            )
 
         self.manager_tree.setSortingEnabled(True)
         self.manager_tree.sortItems(sort_column, sort_order)
@@ -2042,6 +2214,7 @@ class ModpackWindow(QMainWindow):
         summary_warnings = [*inventory_warnings, *self._manager_remote_warnings]
         self.manager_summary_label.setToolTip("\n".join(summary_warnings))
         self.manager_summary_label.setText(summary)
+        self._update_managed_update_summary()
         if selected_item is not None:
             self.manager_tree.setCurrentItem(selected_item)
         else:
@@ -2049,6 +2222,25 @@ class ModpackWindow(QMainWindow):
         self._filter_managed_downloads()
 
     def _managed_selection_changed(self) -> None:
+        selected_item = self.manager_tree.currentItem()
+        selected_parent = (
+            selected_item.parent() if selected_item is not None else None
+        )
+        if (
+            selected_item is not None
+            and selected_parent is not None
+            and not selected_item.isHidden()
+            and not selected_parent.isHidden()
+            and not selected_parent.isExpanded()
+        ):
+            workshop_id = self._managed_parent_workshop_id(selected_parent)
+            if workshop_id:
+                self._manager_expanded_workshop_ids.add(workshop_id)
+            self._manager_expansion_syncing = True
+            try:
+                selected_parent.setExpanded(True)
+            finally:
+                self._manager_expansion_syncing = False
         identity = self._manager_selection_identity()
         if identity is None:
             self.manager_details.clear()
@@ -2139,6 +2331,8 @@ class ModpackWindow(QMainWindow):
         self.manager_check_updates_button.setEnabled(
             bool(self._managed_item_ids) and not busy
         )
+        self.manager_expand_all_button.setEnabled(bool(self._managed_item_ids))
+        self.manager_collapse_all_button.setEnabled(bool(self._managed_item_ids))
         self.manager_add_button.setEnabled(
             record is not None and record.is_valid and not busy
         )
@@ -2334,11 +2528,14 @@ class ModpackWindow(QMainWindow):
             update_count = assessment_codes.count("update_available")
             missing_count = assessment_codes.count("not_stored")
             unknown_count = assessment_codes.count("unknown")
+            update_labels = self._managed_update_labels(workshop_ids)
             self.log.appendPlainText(
                 f"Workshop metadata check complete: {current_count} current, "
                 f"{update_count} update(s) available, {missing_count} without an "
                 f"immutable snapshot, and {unknown_count} unknown."
             )
+            for label in update_labels:
+                self.log.appendPlainText(f"Update available: {label}")
             for warning in result.warnings:
                 self.log.appendPlainText(f"Workshop check warning: {warning}")
 
