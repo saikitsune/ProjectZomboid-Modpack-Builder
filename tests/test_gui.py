@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QMessageBox
 
 from pzmodpack.backend import BuildReport, discover_mods
 from pzmodpack.gui import (
@@ -28,6 +28,37 @@ from pzmodpack.steamcmd import (
 )
 
 
+def _stored_snapshot_fixture(
+    snapshot_root: Path,
+    workshop_id: str,
+    sha256: str,
+    captured_at: str,
+    *,
+    folder: str = "Example",
+    updated_at: str | None = None,
+) -> Path:
+    snapshot = snapshot_root / workshop_id / sha256[:16]
+    mod = snapshot / "mods" / folder / "42"
+    mod.mkdir(parents=True)
+    (mod / "mod.info").write_text(
+        f"name={folder}\nid={folder}Id\n",
+        encoding="utf-8",
+    )
+    metadata: dict[str, object] = {
+        "format_version": 2,
+        "workshop_id": workshop_id,
+        "sha256": sha256,
+        "snapshot_created_at_utc": captured_at,
+    }
+    if updated_at is not None:
+        metadata["workshop_updated_at_utc"] = updated_at
+    (snapshot / "snapshot.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+    return snapshot
+
+
 class GuiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -42,7 +73,7 @@ class GuiTests(unittest.TestCase):
             (mod / "mod.info").write_text("name=Example\nid=ExampleId\n", encoding="utf-8")
             destination = root / "built"
             window = ModpackWindow(run_async=False, persist_session=False)
-            self.assertIn("v0.6.4", window.windowTitle())
+            self.assertIn("v0.7.0", window.windowTitle())
             window.name_edit.setText("GUI Pack")
             window.namespace_edit.setText("GuiPack")
             window.workshop_edit.setText("123")
@@ -94,6 +125,9 @@ class GuiTests(unittest.TestCase):
                 self.assertFalse(window.build_button.isEnabled())
                 self.assertTrue(window.build_progress.isVisible())
                 self.assertIn("Copying test mod", window.build_status.text())
+                self.assertFalse(window.output_edit.isEnabled())
+                self.assertFalse(window.namespace_edit.isEnabled())
+                self.assertFalse(window.browse_output_button.isEnabled())
 
                 release.set()
                 deadline = time.monotonic() + 2
@@ -104,8 +138,29 @@ class GuiTests(unittest.TestCase):
             self.assertFalse(window._workers)
             self.assertTrue(window.build_button.isEnabled())
             self.assertFalse(window.build_progress.isVisible())
+            self.assertTrue(window.output_edit.isEnabled())
+            self.assertTrue(window.namespace_edit.isEnabled())
+            self.assertTrue(window.browse_output_button.isEnabled())
             self.assertIn("Built 1 mod", window.log.toPlainText())
             window.close()
+
+    def test_window_refuses_to_close_while_operation_is_active(self) -> None:
+        window = ModpackWindow(run_async=False, persist_session=False)
+        window.show()
+        self.application.processEvents()
+        window._set_download_running(True)
+
+        with patch(
+            "pzmodpack.gui.QMessageBox.warning",
+            return_value=QMessageBox.StandardButton.Ok,
+        ) as warning:
+            closed = window.close()
+
+        self.assertFalse(closed)
+        self.assertTrue(window.isVisible())
+        warning.assert_called_once()
+        window._set_download_running(False)
+        self.assertTrue(window.close())
 
     def test_bundled_mod_dialog_prevents_conflicting_selections(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -401,6 +456,34 @@ class GuiTests(unittest.TestCase):
             self.assertIn("required-mod issue", window.log.toPlainText())
             window.close()
 
+    def test_build_forces_bundled_selection_after_snapshot_change(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mod = root / "source" / "mods" / "Example" / "42"
+            mod.mkdir(parents=True)
+            (mod / "mod.info").write_text(
+                "name=Example\nid=ExampleId\n",
+                encoding="utf-8",
+            )
+            destination = root / "built"
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.add_source_path(root / "source")
+            window.output_edit.setText(str(destination))
+            window.included_mod_ids = ("ExampleId",)
+            window._mod_selection_needs_review = True
+
+            with patch.object(
+                window,
+                "_show_bundled_mod_selection_dialog",
+                return_value=False,
+            ) as selection:
+                window.build_pack()
+
+            selection.assert_called_once()
+            self.assertFalse(destination.exists())
+            self.assertIn("snapshot changed", window.log.toPlainText())
+            window.close()
+
     def test_account_login_uses_password_field_without_logging_secrets(self) -> None:
         window = ModpackWindow(run_async=False, persist_session=False)
         window.anonymous_check.setChecked(False)
@@ -419,7 +502,7 @@ class GuiTests(unittest.TestCase):
             window.test_steam_login()
         log = window.log.toPlainText()
         self.assertIn("Steam login succeeded", log)
-        self.assertIn("PZ Modpack Builder v0.6.4", log)
+        self.assertIn("PZ Modpack Builder v0.7.0", log)
         self.assertNotIn("super-secret", log)
         self.assertNotIn("ABCDE", log)
         self.assertEqual(window.password_edit.text(), "")
@@ -474,8 +557,8 @@ class GuiTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
 
-            def make_snapshot(name: str, sha256: str, updated: str) -> Path:
-                snapshot = root / "snapshots" / "111" / name
+            def make_snapshot(_name: str, sha256: str, updated: str) -> Path:
+                snapshot = root / "snapshots" / "111" / sha256[:16]
                 mod = snapshot / "mods" / "Example" / "42"
                 mod.mkdir(parents=True)
                 (mod / "mod.info").write_text(
@@ -532,8 +615,10 @@ class GuiTests(unittest.TestCase):
 
             self.assertEqual(window.snapshot_selections, {"111": new_hash})
             self.assertEqual(window.included_mod_ids, ("ExampleId",))
+            self.assertTrue(window._mod_selection_needs_review)
 
             window.snapshot_selections = {"111": old_hash}
+            window._mod_selection_needs_review = False
             second_batch = DownloadBatchResult(
                 SteamCmdResult(True, 0, "Downloaded"),
                 (
@@ -553,6 +638,7 @@ class GuiTests(unittest.TestCase):
                 window.download_workshop_items()
 
             self.assertEqual(window.snapshot_selections, {"111": old_hash})
+            self.assertFalse(window._mod_selection_needs_review)
             window.close()
 
     def test_async_workshop_download_shows_live_progress(self) -> None:
@@ -608,6 +694,618 @@ class GuiTests(unittest.TestCase):
             self.assertTrue(window.download_button.isEnabled())
             self.assertFalse(window.download_progress.isVisible())
             self.assertIn("Locked Workshop 111", window.log.toPlainText())
+            window.close()
+
+    def test_manager_tab_groups_stored_snapshots_and_marks_project_state(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            old_hash = "a" * 64
+            new_hash = "b" * 64
+            old = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                old_hash,
+                "2026-08-18T12:05:00+00:00",
+                updated_at="2026-08-18T12:00:00+00:00",
+            )
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                new_hash,
+                "2026-08-19T12:05:00+00:00",
+                updated_at="2026-08-19T12:00:00+00:00",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.add_source_path(old)
+            window.snapshot_selections = {"111": old_hash}
+
+            window.refresh_managed_downloads()
+
+            self.assertIn(
+                "Manage downloads",
+                [window.tabs.tabText(index) for index in range(window.tabs.count())],
+            )
+            self.assertEqual(window.manager_tree.topLevelItemCount(), 1)
+            parent = window.manager_tree.topLevelItem(0)
+            self.assertIn("Workshop 111", parent.text(0))
+            self.assertEqual(parent.childCount(), 2)
+            self.assertEqual(parent.child(0).text(0), new_hash[:16])
+            self.assertIn("Latest stored", parent.child(0).text(5))
+            self.assertIn("In current pack", parent.child(1).text(5))
+            self.assertIn("Pinned older", parent.child(1).text(5))
+            window.manager_tree.setCurrentItem(parent.child(1))
+            self.assertTrue(window.manager_update_button.isEnabled())
+            self.assertTrue(window.manager_add_button.isEnabled())
+            self.assertIn(old_hash, window.manager_details.toPlainText())
+            window.close()
+
+    def test_manager_update_of_global_item_does_not_add_it_to_current_pack(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                "a" * 64,
+                "2026-08-18T12:05:00+00:00",
+            )
+            new_path = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                "b" * 64,
+                "2026-08-19T12:05:00+00:00",
+            )
+            batch = DownloadBatchResult(
+                SteamCmdResult(True, 0, "Downloaded"),
+                (
+                    WorkshopSnapshot(
+                        "111",
+                        "b" * 64,
+                        new_path,
+                        "2026-08-19T12:05:00+00:00",
+                        created=True,
+                    ),
+                ),
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.workshop_input.setPlainText("999")
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(window.manager_tree.topLevelItem(0))
+
+            with patch(
+                "pzmodpack.gui.download_and_snapshot",
+                return_value=batch,
+            ) as download:
+                window.update_managed_workshop_item()
+
+            self.assertEqual(download.call_args.args[1], ("111",))
+            self.assertEqual(window.workshop_input.toPlainText(), "999")
+            self.assertEqual(window.source_paths(), ())
+            self.assertIn("new immutable snapshot", window.log.toPlainText())
+            window.close()
+
+    def test_manager_update_of_attached_item_selects_the_new_snapshot(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            old_hash = "a" * 64
+            new_hash = "b" * 64
+            old = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                old_hash,
+                "2026-08-18T12:05:00+00:00",
+            )
+            new = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                new_hash,
+                "2026-08-19T12:05:00+00:00",
+            )
+            batch = DownloadBatchResult(
+                SteamCmdResult(True, 0, "Downloaded"),
+                (
+                    WorkshopSnapshot(
+                        "111",
+                        new_hash,
+                        new,
+                        "2026-08-19T12:05:00+00:00",
+                        created=True,
+                    ),
+                ),
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.add_source_path(old)
+            window.snapshot_selections = {"111": old_hash}
+            window.included_mod_ids = ("ExampleId",)
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(window.manager_tree.topLevelItem(0))
+
+            with patch(
+                "pzmodpack.gui.download_and_snapshot",
+                return_value=batch,
+            ):
+                window.update_managed_workshop_item()
+
+            self.assertEqual(window.source_paths(), (old.resolve(), new.resolve()))
+            self.assertEqual(window.snapshot_selections, {"111": new_hash})
+            self.assertEqual(window.included_mod_ids, ("ExampleId",))
+            self.assertTrue(window._mod_selection_needs_review)
+            window.close()
+
+    def test_manager_lists_cache_only_item_as_updateable(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            library = root / "steam-library"
+            cached_mod = (
+                library
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / "108600"
+                / "111"
+                / "mods"
+                / "Cached Example"
+            )
+            cached_mod.mkdir(parents=True)
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(library))
+            window.snapshot_edit.setText(str(root / "snapshots"))
+
+            window.refresh_managed_downloads()
+            parent = window.manager_tree.topLevelItem(0)
+            window.manager_tree.setCurrentItem(parent)
+
+            self.assertEqual(window.manager_tree.topLevelItemCount(), 1)
+            self.assertEqual(parent.childCount(), 0)
+            self.assertIn("Cached Example", parent.text(1))
+            self.assertIn("SteamCMD cache present", parent.text(5))
+            self.assertIn("1 SteamCMD cache item(s)", window.manager_summary_label.text())
+            self.assertTrue(window.manager_update_button.isEnabled())
+            self.assertFalse(window.manager_delete_snapshot_button.isEnabled())
+            self.assertFalse(window.manager_delete_item_button.isEnabled())
+            window.close()
+
+    def test_async_manager_update_shows_progress_and_locks_mutations(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            sha256 = "a" * 64
+            snapshot = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                sha256,
+                "2026-08-19T12:05:00+00:00",
+            )
+            batch = DownloadBatchResult(
+                SteamCmdResult(True, 0, "Downloaded"),
+                (
+                    WorkshopSnapshot(
+                        "111",
+                        sha256,
+                        snapshot,
+                        "2026-08-19T12:05:00+00:00",
+                    ),
+                ),
+            )
+            started = threading.Event()
+            release = threading.Event()
+            window = ModpackWindow(run_async=True, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(window.manager_tree.topLevelItem(0))
+            window.tabs.setCurrentIndex(window.manager_tab_index)
+            window.show()
+            self.application.processEvents()
+
+            def slow_download(
+                _client: object,
+                _ids: object,
+                _credentials: object,
+                _snapshot_root: object,
+                *,
+                progress: object = None,
+            ) -> DownloadBatchResult:
+                started.set()
+                if callable(progress):
+                    progress(45, 100, "Workshop item 1/1: downloading")
+                release.wait(timeout=3)
+                return batch
+
+            with patch(
+                "pzmodpack.gui.download_and_snapshot",
+                side_effect=slow_download,
+            ):
+                window.update_managed_workshop_item()
+                deadline = time.monotonic() + 2
+                while not started.is_set() and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+
+                self.assertTrue(started.is_set())
+                self.application.processEvents()
+                self.assertTrue(window.manager_progress.isVisible())
+                self.assertFalse(window.download_progress.isVisible())
+                self.assertFalse(window.manager_update_button.isEnabled())
+                self.assertFalse(window.open_project_button.isEnabled())
+                self.assertFalse(window.snapshot_edit.isEnabled())
+                self.assertIn("Workshop item 1/1", window.manager_operation_status.text())
+
+                release.set()
+                deadline = time.monotonic() + 2
+                while window._workers and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+
+            self.assertFalse(window._workers)
+            self.assertFalse(window.manager_progress.isVisible())
+            self.assertTrue(window.manager_update_button.isEnabled())
+            self.assertTrue(window.open_project_button.isEnabled())
+            self.assertTrue(window.snapshot_edit.isEnabled())
+            window.close()
+
+    def test_async_manager_update_failure_restores_controls(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                "a" * 64,
+                "2026-08-19T12:05:00+00:00",
+            )
+            window = ModpackWindow(run_async=True, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(window.manager_tree.topLevelItem(0))
+            window.show()
+            self.application.processEvents()
+
+            def failed_download(*_args: object, **_kwargs: object) -> object:
+                raise RuntimeError("simulated SteamCMD failure")
+
+            with patch(
+                "pzmodpack.gui.download_and_snapshot",
+                side_effect=failed_download,
+            ):
+                window.update_managed_workshop_item()
+                deadline = time.monotonic() + 2
+                while window._workers and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+
+            self.assertFalse(window._workers)
+            self.assertFalse(window.manager_progress.isVisible())
+            self.assertTrue(window.manager_update_button.isEnabled())
+            self.assertTrue(window.open_project_button.isEnabled())
+            self.assertIn("simulated SteamCMD failure", window.log.toPlainText())
+            window.close()
+
+    def test_manager_can_attach_a_specific_stored_snapshot(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            snapshot_root = Path(temporary_directory) / "snapshots"
+            sha256 = "a" * 64
+            snapshot = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                sha256,
+                "2026-08-18T12:05:00+00:00",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(
+                str(Path(temporary_directory) / "steam-library")
+            )
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.refresh_managed_downloads()
+            child = window.manager_tree.topLevelItem(0).child(0)
+            window.manager_tree.setCurrentItem(child)
+
+            window.add_managed_snapshot_to_pack()
+
+            self.assertEqual(window.source_paths(), (snapshot.resolve(),))
+            self.assertEqual(window.snapshot_selections, {"111": sha256})
+            refreshed_child = window.manager_tree.topLevelItem(0).child(0)
+            self.assertIn("Selected latest", refreshed_child.text(5))
+            window.close()
+
+    def test_manager_use_of_already_effective_snapshot_does_not_require_review(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            sha256 = "a" * 64
+            snapshot = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                sha256,
+                "2026-08-19T12:05:00+00:00",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.add_source_path(snapshot)
+            window.included_mod_ids = ("ExampleId",)
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(
+                window.manager_tree.topLevelItem(0).child(0)
+            )
+
+            window.add_managed_snapshot_to_pack()
+
+            self.assertEqual(window.snapshot_selections, {"111": sha256})
+            self.assertFalse(window._mod_selection_needs_review)
+            window.close()
+
+    def test_manager_delete_selected_snapshot_falls_back_without_resetting_mods(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            snapshot_root = Path(temporary_directory) / "snapshots"
+            old_hash = "a" * 64
+            new_hash = "b" * 64
+            old = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                old_hash,
+                "2026-08-18T12:05:00+00:00",
+            )
+            new = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                new_hash,
+                "2026-08-19T12:05:00+00:00",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(
+                str(Path(temporary_directory) / "steam-library")
+            )
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.add_source_path(old)
+            window.add_source_path(new)
+            window.snapshot_selections = {"111": new_hash}
+            window.included_mod_ids = ("ExampleId",)
+            window.refresh_managed_downloads()
+            newest = window.manager_tree.topLevelItem(0).child(0)
+            window.manager_tree.setCurrentItem(newest)
+
+            with patch(
+                "pzmodpack.gui.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                window.delete_managed_snapshot()
+
+            self.assertFalse(new.exists())
+            self.assertTrue(old.exists())
+            self.assertEqual(window.source_paths(), (old.resolve(),))
+            self.assertEqual(window.snapshot_selections, {"111": old_hash})
+            self.assertEqual(window.included_mod_ids, ("ExampleId",))
+            self.assertIn("review required", window.mod_selection_label.text())
+            window.close()
+
+    def test_manager_delete_confirmation_cancel_is_a_no_op(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            sha256 = "a" * 64
+            snapshot = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                sha256,
+                "2026-08-19T12:05:00+00:00",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.add_source_path(snapshot)
+            window.snapshot_selections = {"111": sha256}
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(
+                window.manager_tree.topLevelItem(0).child(0)
+            )
+
+            with patch(
+                "pzmodpack.gui.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ):
+                window.delete_managed_snapshot()
+
+            self.assertTrue(snapshot.exists())
+            self.assertEqual(window.source_paths(), (snapshot.resolve(),))
+            self.assertEqual(window.snapshot_selections, {"111": sha256})
+            self.assertFalse(window._manager_delete_running)
+            window.close()
+
+    def test_manager_delete_failure_restores_controls_and_project_state(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            sha256 = "a" * 64
+            snapshot = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                sha256,
+                "2026-08-19T12:05:00+00:00",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.add_source_path(snapshot)
+            window.snapshot_selections = {"111": sha256}
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(
+                window.manager_tree.topLevelItem(0).child(0)
+            )
+
+            with (
+                patch(
+                    "pzmodpack.gui.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch(
+                    "pzmodpack.gui.delete_stored_workshop_snapshot",
+                    side_effect=PermissionError("snapshot is in use"),
+                ),
+            ):
+                window.delete_managed_snapshot()
+
+            self.assertTrue(snapshot.exists())
+            self.assertEqual(window.source_paths(), (snapshot.resolve(),))
+            self.assertEqual(window.snapshot_selections, {"111": sha256})
+            self.assertFalse(window._manager_delete_running)
+            self.assertTrue(window.build_button.isEnabled())
+            self.assertTrue(window.download_button.isEnabled())
+            self.assertIn("snapshot is in use", window.log.toPlainText())
+            window.close()
+
+    def test_deleting_unattached_stale_selection_keeps_attached_revision(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            old_hash = "a" * 64
+            new_hash = "b" * 64
+            old = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                old_hash,
+                "2026-08-18T12:05:00+00:00",
+            )
+            new = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                new_hash,
+                "2026-08-19T12:05:00+00:00",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.add_source_path(old)
+            window.snapshot_selections = {"111": new_hash}
+            window.included_mod_ids = ("ExampleId",)
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(
+                window.manager_tree.topLevelItem(0).child(0)
+            )
+
+            with patch(
+                "pzmodpack.gui.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                window.delete_managed_snapshot()
+
+            self.assertFalse(new.exists())
+            self.assertTrue(old.exists())
+            self.assertEqual(window.source_paths(), (old.resolve(),))
+            self.assertEqual(window.snapshot_selections, {})
+            self.assertFalse(window._mod_selection_needs_review)
+            self.assertIn("attached snapshot did not change", window.log.toPlainText())
+            window.close()
+
+    def test_manager_delete_all_prunes_project_but_keeps_steam_cache(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            library = root / "steam-library"
+            old = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                "a" * 64,
+                "2026-08-18T12:05:00+00:00",
+            )
+            new = _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                "b" * 64,
+                "2026-08-19T12:05:00+00:00",
+            )
+            cache = library / "steamapps" / "workshop" / "content" / "108600" / "111"
+            cache.mkdir(parents=True)
+            cache_sentinel = cache / "cached.txt"
+            cache_sentinel.write_text("mutable Steam cache", encoding="utf-8")
+            local_source = root / "local-mods"
+            local_source.mkdir()
+
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(library))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.add_source_path(old)
+            window.add_source_path(new)
+            window.add_source_path(local_source)
+            window.snapshot_selections = {"111": "b" * 64}
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(window.manager_tree.topLevelItem(0))
+
+            with patch(
+                "pzmodpack.gui.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                window.delete_managed_workshop_item()
+
+            self.assertFalse((snapshot_root / "111").exists())
+            self.assertTrue(cache_sentinel.is_file())
+            self.assertEqual(window.source_paths(), (local_source.resolve(),))
+            self.assertEqual(window.snapshot_selections, {})
+            self.assertFalse(window._mod_selection_needs_review)
+            self.assertEqual(window.manager_tree.topLevelItemCount(), 1)
+            self.assertEqual(window.manager_tree.topLevelItem(0).childCount(), 0)
+            window.close()
+
+    def test_manager_surfaces_malformed_snapshot_without_allowing_attach(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            malformed = snapshot_root / "111" / ("a" * 16)
+            malformed.mkdir(parents=True)
+            (malformed / "snapshot.json").write_text("not json", encoding="utf-8")
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+
+            window.refresh_managed_downloads()
+            child = window.manager_tree.topLevelItem(0).child(0)
+            window.manager_tree.setCurrentItem(child)
+
+            self.assertIn("storage warning", window.manager_summary_label.text())
+            self.assertIn("Metadata warning", child.text(5))
+            self.assertFalse(window.manager_add_button.isEnabled())
+            self.assertTrue(window.manager_delete_snapshot_button.isEnabled())
+            self.assertIn("malformed", window.manager_details.toPlainText())
+            window.close()
+
+    def test_manager_refuses_snapshot_root_overlapping_steam_cache(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            library = root / "steam-library"
+            cache_root = (
+                library / "steamapps" / "workshop" / "content" / "108600"
+            )
+            cache_mods = cache_root / "111" / "mods"
+            cache_mods.mkdir(parents=True)
+            sentinel = cache_mods / "keep.txt"
+            sentinel.write_text("cache payload", encoding="utf-8")
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(library))
+            window.snapshot_edit.setText(str(cache_root))
+
+            window.refresh_managed_downloads()
+
+            self.assertEqual(window.manager_tree.topLevelItemCount(), 0)
+            self.assertIn("Unsafe snapshot library", window.manager_summary_label.text())
+            self.assertFalse(window.manager_delete_snapshot_button.isEnabled())
+            self.assertFalse(window.manager_delete_item_button.isEnabled())
+            window.workshop_input.setPlainText("111")
+            with patch("pzmodpack.gui.download_and_snapshot") as download:
+                window.download_workshop_items()
+            download.assert_not_called()
+            self.assertIn("must be separate", window.log.toPlainText())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "cache payload")
             window.close()
 
     def test_authenticated_user_can_upload_built_pack_and_capture_new_id(self) -> None:

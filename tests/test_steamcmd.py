@@ -1,6 +1,8 @@
+import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import threading
 import unittest
@@ -13,19 +15,60 @@ from pzmodpack.steamcmd import (
     SteamCmdClient,
     SteamCmdResult,
     SteamCredentials,
+    StoredWorkshopSnapshot,
+    WorkshopSnapshotInventory,
     WorkshopUploadConfig,
+    _directory_hash,
     _vdf_escape,
     build_command_script,
     build_workshop_description,
     build_upload_script,
     create_snapshot,
+    delete_all_stored_workshop_snapshots,
+    delete_stored_workshop_snapshot,
     download_and_snapshot,
     install_steamcmd,
+    list_stored_workshop_snapshots,
     parse_workshop_ids,
     redact_secrets,
     upload_modpack,
     write_upload_vdf,
 )
+
+
+def _stored_snapshot_fixture(
+    root: Path,
+    workshop_id: str,
+    sha256: str,
+    *,
+    format_version: int = 2,
+    captured: str | None = "2026-08-19T12:00:00+00:00",
+    updated: str | None = "2026-08-19T11:00:00+00:00",
+    manifest_id: str | None = "123456789",
+) -> Path:
+    snapshot = root / workshop_id / sha256[:16]
+    mod = snapshot / "mods" / f"Mod{workshop_id}"
+    mod.mkdir(parents=True)
+    (mod / "mod.info").write_text(
+        f"name=Mod {workshop_id}\nid=Mod{workshop_id}\n",
+        encoding="utf-8",
+    )
+    metadata: dict[str, object] = {
+        "format_version": format_version,
+        "workshop_id": workshop_id,
+        "sha256": sha256,
+    }
+    if captured is not None:
+        metadata["snapshot_created_at_utc"] = captured
+    if updated is not None:
+        metadata["workshop_updated_at_utc"] = updated
+    if manifest_id is not None:
+        metadata["workshop_manifest_id"] = manifest_id
+    (snapshot / "snapshot.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+    return snapshot
 
 
 def _parse_workshop_vdf(text: str) -> dict[str, str]:
@@ -611,6 +654,366 @@ class SteamCmdInstallerTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_directory_hash_preserves_platform_path_order_for_existing_snapshots(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "Z.txt").write_bytes(b"upper")
+            (root / "a.txt").write_bytes(b"lower")
+            order = (
+                (("a.txt", b"lower"), ("Z.txt", b"upper"))
+                if os.name == "nt"
+                else (("Z.txt", b"upper"), ("a.txt", b"lower"))
+            )
+            expected = hashlib.sha256()
+            for name, contents in order:
+                expected.update(name.encode("utf-8"))
+                expected.update(b"\0")
+                expected.update(contents)
+
+            self.assertEqual(_directory_hash(root), expected.hexdigest())
+
+    def test_inventory_lists_valid_legacy_and_malformed_snapshots_newest_first(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "snapshots"
+            old_hash = "a" * 64
+            newest_hash = "b" * 64
+            malformed_hash = "c" * 64
+            empty_metadata_hash = "d" * 64
+            legacy = _stored_snapshot_fixture(
+                root,
+                "111",
+                old_hash,
+                format_version=1,
+                captured=None,
+                updated=None,
+                manifest_id=None,
+            )
+            os.utime(
+                legacy / "snapshot.json",
+                (1_700_000_000, 1_700_000_000),
+            )
+            _stored_snapshot_fixture(
+                root,
+                "111",
+                newest_hash,
+                updated="2026-08-20T09:00:00+00:00",
+            )
+            malformed = root / "111" / malformed_hash[:16]
+            malformed.mkdir(parents=True)
+            (malformed / "snapshot.json").write_text("{broken", encoding="utf-8")
+            empty_metadata = root / "111" / empty_metadata_hash[:16]
+            empty_metadata.mkdir(parents=True)
+            (empty_metadata / "snapshot.json").write_text("{}", encoding="utf-8")
+            (root / "not-a-workshop-id").mkdir()
+
+            inventory = list_stored_workshop_snapshots(root)
+
+            self.assertIsInstance(inventory, WorkshopSnapshotInventory)
+            self.assertEqual(len(inventory.snapshots), 4)
+            self.assertTrue(
+                all(isinstance(item, StoredWorkshopSnapshot) for item in inventory.snapshots)
+            )
+            self.assertEqual(inventory.snapshots[0].sha256, newest_hash)
+            states = {
+                item.revision_directory: item.metadata_state
+                for item in inventory.snapshots
+            }
+            self.assertEqual(states[old_hash[:16]], "legacy")
+            self.assertEqual(states[newest_hash[:16]], "valid")
+            self.assertEqual(states[malformed_hash[:16]], "malformed")
+            self.assertEqual(states[empty_metadata_hash[:16]], "malformed")
+            self.assertFalse(
+                next(
+                    item
+                    for item in inventory.snapshots
+                    if item.revision_directory == malformed_hash[:16]
+                ).is_valid
+            )
+            self.assertEqual(inventory.snapshots[0].mod_folders, ("Mod111",))
+            self.assertTrue(any("not-a-workshop-id" in item for item in inventory.warnings))
+            self.assertTrue(any("malformed" in item.lower() for item in inventory.warnings))
+
+    def test_inventory_of_missing_root_is_empty(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "missing"
+
+            inventory = list_stored_workshop_snapshots(root)
+
+            self.assertEqual(inventory.snapshot_root, root.absolute())
+            self.assertEqual(inventory.snapshots, ())
+            self.assertEqual(inventory.warnings, ())
+
+    def test_delete_one_snapshot_returns_remaining_and_prunes_only_empty_item(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "snapshots"
+            old_hash = "a" * 64
+            latest_hash = "b" * 64
+            old = _stored_snapshot_fixture(
+                root,
+                "111",
+                old_hash,
+                updated="2026-08-18T09:00:00+00:00",
+            )
+            latest = _stored_snapshot_fixture(
+                root,
+                "111",
+                latest_hash,
+                updated="2026-08-20T09:00:00+00:00",
+            )
+            unrelated = _stored_snapshot_fixture(root, "222", "d" * 64)
+
+            first = delete_stored_workshop_snapshot(root, "111", old.name)
+
+            self.assertEqual(first.deleted_paths, (old.absolute(),))
+            self.assertFalse(old.exists())
+            self.assertTrue(latest.is_dir())
+            self.assertTrue(unrelated.is_dir())
+            self.assertEqual([item.sha256 for item in first.remaining], [latest_hash])
+            second = delete_stored_workshop_snapshot(root, "111", latest.name)
+            self.assertFalse((root / "111").exists())
+            self.assertTrue(root.is_dir())
+            self.assertTrue(unrelated.is_dir())
+            self.assertEqual(second.remaining, ())
+
+    def test_delete_all_preflights_and_preserves_other_workshop_items(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "snapshots"
+            first = _stored_snapshot_fixture(root, "111", "a" * 64)
+            second = _stored_snapshot_fixture(root, "111", "b" * 64)
+            unrelated = _stored_snapshot_fixture(root, "222", "c" * 64)
+
+            result = delete_all_stored_workshop_snapshots(root, "111")
+
+            self.assertEqual(set(result.deleted_paths), {first.absolute(), second.absolute()})
+            self.assertEqual(result.remaining, ())
+            self.assertFalse((root / "111").exists())
+            self.assertTrue(unrelated.is_dir())
+
+    def test_delete_rejects_traversal_and_nested_links_without_touching_target(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "snapshots"
+            snapshot = _stored_snapshot_fixture(root, "111", "a" * 64)
+            outside = base / "outside"
+            outside.mkdir()
+            sentinel = outside / "keep.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+            link = snapshot / "mods" / "outside-link"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Directory symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "revision directory"):
+                delete_stored_workshop_snapshot(root, "111", "..")
+            with self.assertRaisesRegex(ValueError, "link|reparse"):
+                delete_stored_workshop_snapshot(root, "111", snapshot.name)
+
+            self.assertTrue(snapshot.is_dir())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_delete_all_does_not_partially_delete_when_an_entry_is_unsafe(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "snapshots"
+            safe = _stored_snapshot_fixture(root, "111", "a" * 64)
+            outside = base / "outside"
+            outside.mkdir()
+            unsafe = root / "111" / ("b" * 16)
+            try:
+                unsafe.symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Directory symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "link|reparse"):
+                delete_all_stored_workshop_snapshots(root, "111")
+
+            self.assertTrue(safe.is_dir())
+            self.assertTrue(outside.is_dir())
+
+    def test_deletion_rejects_the_mutable_steam_workshop_cache(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            cache_root = (
+                Path(temporary_directory)
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / "108600"
+            )
+            snapshot = _stored_snapshot_fixture(cache_root, "111", "a" * 64)
+            sentinel = snapshot / "mods" / "keep.txt"
+            sentinel.write_text("cache payload", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "mutable Workshop cache"):
+                delete_stored_workshop_snapshot(cache_root, "111", snapshot.name)
+            with self.assertRaisesRegex(ValueError, "mutable Workshop cache"):
+                delete_all_stored_workshop_snapshots(cache_root, "111")
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "cache payload")
+
+    def test_deletion_rejects_non_hash_storage_entries(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "snapshots"
+            unexpected = root / "111" / "mods"
+            unexpected.mkdir(parents=True)
+            sentinel = unexpected / "keep.txt"
+            sentinel.write_text("not a snapshot", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "revision directory"):
+                delete_stored_workshop_snapshot(root, "111", "mods")
+            with self.assertRaisesRegex(ValueError, "revision directory"):
+                delete_all_stored_workshop_snapshots(root, "111")
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "not a snapshot")
+
+    def test_snapshot_creation_rejects_overlapping_cache_and_storage_roots(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            downloaded = (
+                root
+                / "steam-library"
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / "108600"
+                / "111"
+            )
+            mod_info = downloaded / "mods" / "Example" / "mod.info"
+            mod_info.parent.mkdir(parents=True)
+            mod_info.write_text("id=Example\n", encoding="utf-8")
+
+            for snapshot_root in (
+                downloaded,
+                downloaded / "snapshots",
+                downloaded.parent,
+            ):
+                with (
+                    self.subTest(snapshot_root=snapshot_root),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "must be separate|mutable Workshop cache",
+                    ),
+                ):
+                    create_snapshot(downloaded, snapshot_root, "111")
+
+            self.assertEqual(mod_info.read_text(encoding="utf-8"), "id=Example\n")
+            self.assertFalse((downloaded / "snapshot.json").exists())
+
+    def test_existing_snapshot_payload_is_verified_before_reuse(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            downloaded = root / "downloads" / "111"
+            mod_info = downloaded / "mods" / "Example" / "mod.info"
+            mod_info.parent.mkdir(parents=True)
+            mod_info.write_text("id=Example\n", encoding="utf-8")
+            first = create_snapshot(downloaded, root / "snapshots", "111")
+            stored_mod_info = first.path / "mods" / "Example" / "mod.info"
+            stored_mod_info.write_text("id=Tampered\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "payload hash"):
+                create_snapshot(downloaded, root / "snapshots", "111")
+
+            self.assertEqual(stored_mod_info.read_text(encoding="utf-8"), "id=Tampered\n")
+
+    def test_existing_snapshot_without_metadata_is_not_blessed(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            downloaded = root / "downloads" / "111"
+            mod_info = downloaded / "mods" / "Example" / "mod.info"
+            mod_info.parent.mkdir(parents=True)
+            mod_info.write_text("id=Example\n", encoding="utf-8")
+            sha256 = _directory_hash(downloaded)
+            destination = root / "snapshots" / "111" / sha256[:16]
+            shutil.copytree(downloaded, destination)
+
+            with self.assertRaisesRegex(ValueError, "metadata"):
+                create_snapshot(downloaded, root / "snapshots", "111")
+
+            self.assertFalse((destination / "snapshot.json").exists())
+
+    def test_identical_snapshot_reuses_payload_and_updates_provenance(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            downloaded = root / "downloads" / "111"
+            mod_info = downloaded / "mods" / "Example" / "mod.info"
+            mod_info.parent.mkdir(parents=True)
+            mod_info.write_text("id=Example\n", encoding="utf-8")
+
+            first = create_snapshot(
+                downloaded,
+                root / "snapshots",
+                "111",
+                workshop_updated_at_utc="2026-08-19T10:00:00+00:00",
+                workshop_manifest_id="1111",
+            )
+            payload_mtime = (first.path / "mods" / "Example" / "mod.info").stat().st_mtime_ns
+            second = create_snapshot(
+                downloaded,
+                root / "snapshots",
+                "111",
+                workshop_updated_at_utc="2026-08-20T10:00:00+00:00",
+                workshop_manifest_id="2222",
+            )
+
+            self.assertTrue(first.created)
+            self.assertFalse(second.created)
+            self.assertEqual(first.path, second.path)
+            self.assertEqual(
+                (first.path / "mods" / "Example" / "mod.info").stat().st_mtime_ns,
+                payload_mtime,
+            )
+            metadata = json.loads(
+                (first.path / "snapshot.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["workshop_updated_at_utc"], "2026-08-20T10:00:00+00:00")
+            self.assertEqual(metadata["workshop_manifest_id"], "2222")
+
+    def test_new_snapshot_copy_is_verified_and_partial_staging_is_cleaned(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            downloaded = root / "downloads" / "111"
+            mod_info = downloaded / "mods" / "Example" / "mod.info"
+            mod_info.parent.mkdir(parents=True)
+            mod_info.write_text("id=Example\n", encoding="utf-8")
+            expected_sha256 = _directory_hash(downloaded)
+            with patch(
+                "pzmodpack.steamcmd._directory_hash",
+                side_effect=(expected_sha256, "f" * 64),
+            ):
+                with self.assertRaisesRegex(ValueError, "changed while being copied"):
+                    create_snapshot(downloaded, root / "snapshots", "111")
+
+            item_root = root / "snapshots" / "111"
+            self.assertTrue(item_root.is_dir())
+            self.assertEqual(list(item_root.iterdir()), [])
+
+    def test_prefix_collision_uses_full_hash_directory(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            downloaded = root / "downloads" / "111"
+            mod_info = downloaded / "mods" / "Example" / "mod.info"
+            mod_info.parent.mkdir(parents=True)
+            mod_info.write_text("id=Example\n", encoding="utf-8")
+            expected = _directory_hash(downloaded)
+            colliding = expected[:16] + ("f" * 48)
+            if colliding == expected:
+                colliding = expected[:16] + ("e" * 48)
+            existing = _stored_snapshot_fixture(root / "snapshots", "111", colliding)
+
+            created = create_snapshot(downloaded, root / "snapshots", "111")
+
+            self.assertTrue(created.created)
+            self.assertEqual(created.path.name, expected)
+            self.assertTrue(existing.is_dir())
+
     def test_snapshots_are_immutable_and_content_addressed(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

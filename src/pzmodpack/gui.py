@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -59,13 +61,22 @@ from .session import (
     save_steam_session,
 )
 from .steamcmd import (
+    StoredWorkshopSnapshot,
     SteamCmdClient,
     SteamCredentials,
+    delete_all_stored_workshop_snapshots,
+    delete_stored_workshop_snapshot,
     download_and_snapshot,
     install_steamcmd,
+    list_stored_workshop_snapshots,
     parse_workshop_ids,
     upload_modpack,
 )
+
+
+_MANAGED_KIND_ROLE = int(Qt.ItemDataRole.UserRole)
+_MANAGED_WORKSHOP_ID_ROLE = _MANAGED_KIND_ROLE + 1
+_MANAGED_REVISION_ROLE = _MANAGED_KIND_ROLE + 2
 
 
 class OperationWorker(QThread):
@@ -142,6 +153,30 @@ def _display_snapshot_time(value: str | None) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
+
+
+def _snapshot_time_value(value: str | None) -> float:
+    if not value:
+        return float("-inf")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _stored_snapshot_sort_key(
+    record: StoredWorkshopSnapshot,
+) -> tuple[float, float, str]:
+    captured = _snapshot_time_value(record.snapshot_created_at_utc)
+    updated = _snapshot_time_value(record.workshop_updated_at_utc)
+    return (
+        updated if updated != float("-inf") else captured,
+        captured,
+        record.revision_directory,
+    )
 
 
 class WorkshopSnapshotSelectionDialog(QDialog):
@@ -729,6 +764,14 @@ class ModpackWindow(QMainWindow):
         self.run_async = run_async
         self.persist_session = persist_session
         self._workers: set[QThread] = set()
+        self._build_running = False
+        self._download_running = False
+        self._download_in_manager = False
+        self._manager_delete_running = False
+        self._generic_operation_running = False
+        self._mod_selection_needs_review = False
+        self._managed_records: dict[tuple[str, str], StoredWorkshopSnapshot] = {}
+        self._manager_restore_selection: tuple[str, str | None] | None = None
         self.setWindowTitle(f"PZ Modpack Builder v{__version__}")
         self.resize(1040, 780)
         workspace = Path.home() / ".pzmodpack-builder"
@@ -812,14 +855,20 @@ class ModpackWindow(QMainWindow):
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("Scan, SteamCMD, and build results appear here.")
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_tab(), "Build pack")
-        tabs.addTab(self._steam_tab(), "Workshop downloads")
-        tabs.addTab(self._upload_tab(), "Workshop upload")
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_tab(), "Build pack")
+        self.tabs.addTab(self._steam_tab(), "Workshop downloads")
+        self.manager_tab_index = self.tabs.addTab(
+            self._manage_downloads_tab(),
+            "Manage downloads",
+        )
+        self.tabs.addTab(self._upload_tab(), "Workshop upload")
+        self.tabs.currentChanged.connect(self._tab_changed)
         self._update_login_fields(self.anonymous_check.isChecked())
+        self._update_operation_controls()
 
         splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(tabs)
+        splitter.addWidget(self.tabs)
         splitter.addWidget(self.log)
         splitter.setSizes([550, 190])
 
@@ -839,7 +888,8 @@ class ModpackWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #171a21; color: #d6d7d8; }
-            QLineEdit, QListWidget, QPlainTextEdit, QComboBox, QTabWidget::pane {
+            QLineEdit, QListWidget, QPlainTextEdit, QComboBox, QTreeWidget,
+            QTabWidget::pane {
                 background: #202530; border: 1px solid #3a4353; border-radius: 5px;
                 padding: 6px; color: #f2f3f5; selection-background-color: #3b82f6;
             }
@@ -878,9 +928,9 @@ class ModpackWindow(QMainWindow):
         form.addRow("Description", self.description_edit)
         preview_row = QHBoxLayout()
         preview_row.addWidget(self.preview_edit, 1)
-        browse_preview = QPushButton("Browse...")
-        browse_preview.clicked.connect(self.choose_preview)
-        preview_row.addWidget(browse_preview)
+        self.browse_preview_button = QPushButton("Browse...")
+        self.browse_preview_button.clicked.connect(self.choose_preview)
+        preview_row.addWidget(self.browse_preview_button)
         form.addRow("Workshop preview", preview_row)
         form.addRow("Workshop visibility", self.visibility_combo)
         form.addRow("Version bump on rebuild", self.version_bump_combo)
@@ -889,39 +939,41 @@ class ModpackWindow(QMainWindow):
         bundled_mod_row = QHBoxLayout()
         self.mod_selection_label = QLabel("All discovered bundled mods")
         bundled_mod_row.addWidget(self.mod_selection_label, 1)
-        select_bundled_mods = QPushButton("Select snapshots and bundled mods...")
-        select_bundled_mods.clicked.connect(self.select_bundled_mods)
-        bundled_mod_row.addWidget(select_bundled_mods)
+        self.select_bundled_mods_button = QPushButton(
+            "Select snapshots and bundled mods..."
+        )
+        self.select_bundled_mods_button.clicked.connect(self.select_bundled_mods)
+        bundled_mod_row.addWidget(self.select_bundled_mods_button)
         form.addRow("Snapshot and mod selection", bundled_mod_row)
         output_row = QHBoxLayout()
         output_row.addWidget(self.output_edit, 1)
-        browse_output = QPushButton("Browse...")
-        browse_output.clicked.connect(self.choose_output)
-        output_row.addWidget(browse_output)
+        self.browse_output_button = QPushButton("Browse...")
+        self.browse_output_button.clicked.connect(self.choose_output)
+        output_row.addWidget(self.browse_output_button)
         form.addRow("Output directory", output_row)
         layout.addLayout(form)
         project_buttons = QHBoxLayout()
-        open_project = QPushButton("Open project...")
-        open_project.clicked.connect(self.open_project_dialog)
-        save_project_button = QPushButton("Save project...")
-        save_project_button.clicked.connect(self.save_project_dialog)
-        project_buttons.addWidget(open_project)
-        project_buttons.addWidget(save_project_button)
+        self.open_project_button = QPushButton("Open project...")
+        self.open_project_button.clicked.connect(self.open_project_dialog)
+        self.save_project_button = QPushButton("Save project...")
+        self.save_project_button.clicked.connect(self.save_project_dialog)
+        project_buttons.addWidget(self.open_project_button)
+        project_buttons.addWidget(self.save_project_button)
         project_buttons.addStretch(1)
         layout.addLayout(project_buttons)
         layout.addWidget(QLabel("Workshop snapshots or local mod source folders"))
         layout.addWidget(self.source_list, 1)
         source_buttons = QHBoxLayout()
-        add_source = QPushButton("Add source folder")
-        add_source.clicked.connect(self.add_source_dialog)
-        remove_source = QPushButton("Remove selected")
-        remove_source.clicked.connect(self.remove_selected_sources)
-        scan = QPushButton("Scan")
-        scan.clicked.connect(self.scan_sources)
-        source_buttons.addWidget(add_source)
-        source_buttons.addWidget(remove_source)
+        self.add_source_button = QPushButton("Add source folder")
+        self.add_source_button.clicked.connect(self.add_source_dialog)
+        self.remove_source_button = QPushButton("Remove selected")
+        self.remove_source_button.clicked.connect(self.remove_selected_sources)
+        self.scan_button = QPushButton("Scan")
+        self.scan_button.clicked.connect(self.scan_sources)
+        source_buttons.addWidget(self.add_source_button)
+        source_buttons.addWidget(self.remove_source_button)
         source_buttons.addStretch(1)
-        source_buttons.addWidget(scan)
+        source_buttons.addWidget(self.scan_button)
         layout.addLayout(source_buttons)
         self.build_button = QPushButton("Build modpack")
         self.build_button.setObjectName("primaryButton")
@@ -945,12 +997,12 @@ class ModpackWindow(QMainWindow):
         paths = QFormLayout()
         steamcmd_row = QHBoxLayout()
         steamcmd_row.addWidget(self.steamcmd_edit, 1)
-        browse = QPushButton("Browse...")
-        browse.clicked.connect(self.choose_steamcmd)
-        install = QPushButton("Install SteamCMD")
-        install.clicked.connect(self.install_managed_steamcmd)
-        steamcmd_row.addWidget(browse)
-        steamcmd_row.addWidget(install)
+        self.browse_steamcmd_button = QPushButton("Browse...")
+        self.browse_steamcmd_button.clicked.connect(self.choose_steamcmd)
+        self.install_steamcmd_button = QPushButton("Install SteamCMD")
+        self.install_steamcmd_button.clicked.connect(self.install_managed_steamcmd)
+        steamcmd_row.addWidget(self.browse_steamcmd_button)
+        steamcmd_row.addWidget(self.install_steamcmd_button)
         paths.addRow("SteamCMD executable", steamcmd_row)
         paths.addRow("Steam library/cache", self.library_edit)
         paths.addRow("Immutable snapshots", self.snapshot_edit)
@@ -967,12 +1019,12 @@ class ModpackWindow(QMainWindow):
         login_form.addRow("Steam Guard code", self.guard_edit)
         layout.addLayout(login_form)
         login_buttons = QHBoxLayout()
-        test_login = QPushButton("Test Steam login")
-        test_login.clicked.connect(self.test_steam_login)
-        forget_login = QPushButton("Forget saved account")
-        forget_login.clicked.connect(self.forget_saved_steam_account)
-        login_buttons.addWidget(test_login)
-        login_buttons.addWidget(forget_login)
+        self.test_login_button = QPushButton("Test Steam login")
+        self.test_login_button.clicked.connect(self.test_steam_login)
+        self.forget_login_button = QPushButton("Forget saved account")
+        self.forget_login_button.clicked.connect(self.forget_saved_steam_account)
+        login_buttons.addWidget(self.test_login_button)
+        login_buttons.addWidget(self.forget_login_button)
         login_buttons.addStretch(1)
         layout.addLayout(login_buttons)
 
@@ -998,6 +1050,110 @@ class ModpackWindow(QMainWindow):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
+        return panel
+
+    def _manage_downloads_tab(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        heading = QLabel("Manage immutable Workshop downloads")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+        explanation = QLabel(
+            "Browse every Workshop item in the configured snapshot library, update one "
+            "item through SteamCMD, attach a stored revision to this pack, or explicitly "
+            "delete snapshots you no longer need. Updates never replace older revisions."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.manager_root_label = QLabel()
+        self.manager_root_label.setWordWrap(True)
+        layout.addWidget(self.manager_root_label)
+        self.manager_summary_label = QLabel("Snapshot library has not been scanned yet.")
+        self.manager_summary_label.setWordWrap(True)
+        layout.addWidget(self.manager_summary_label)
+
+        self.manager_tree = QTreeWidget()
+        self.manager_tree.setColumnCount(6)
+        self.manager_tree.setHeaderLabels(
+            (
+                "Workshop item / snapshot",
+                "Bundled folders",
+                "Workshop updated",
+                "Snapshot captured",
+                "Manifest",
+                "Status",
+            )
+        )
+        manager_header = self.manager_tree.header()
+        manager_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        manager_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in range(2, 5):
+            manager_header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        manager_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.manager_tree.itemSelectionChanged.connect(
+            self._managed_selection_changed
+        )
+        layout.addWidget(self.manager_tree, 1)
+
+        buttons = QHBoxLayout()
+        self.manager_refresh_button = QPushButton("Refresh")
+        self.manager_refresh_button.clicked.connect(self.refresh_managed_downloads)
+        self.manager_update_button = QPushButton("Update selected item")
+        self.manager_update_button.clicked.connect(
+            self.update_managed_workshop_item
+        )
+        self.manager_add_button = QPushButton("Use snapshot in current pack")
+        self.manager_add_button.clicked.connect(
+            self.add_managed_snapshot_to_pack
+        )
+        self.manager_delete_snapshot_button = QPushButton("Delete snapshot...")
+        self.manager_delete_snapshot_button.clicked.connect(
+            self.delete_managed_snapshot
+        )
+        self.manager_delete_item_button = QPushButton("Delete all for item...")
+        self.manager_delete_item_button.clicked.connect(
+            self.delete_managed_workshop_item
+        )
+        buttons.addWidget(self.manager_refresh_button)
+        buttons.addWidget(self.manager_update_button)
+        buttons.addWidget(self.manager_add_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.manager_delete_snapshot_button)
+        buttons.addWidget(self.manager_delete_item_button)
+        layout.addLayout(buttons)
+
+        self.manager_details = QPlainTextEdit()
+        self.manager_details.setReadOnly(True)
+        self.manager_details.setMaximumHeight(120)
+        self.manager_details.setPlaceholderText(
+            "Select a Workshop item or snapshot to see its stored provenance."
+        )
+        layout.addWidget(self.manager_details)
+        self.manager_operation_status = QLabel("Ready")
+        self.manager_operation_status.hide()
+        layout.addWidget(self.manager_operation_status)
+        self.manager_progress = QProgressBar()
+        self.manager_progress.setRange(0, 100)
+        self.manager_progress.setValue(0)
+        self.manager_progress.setFormat("%p%")
+        self.manager_progress.hide()
+        layout.addWidget(self.manager_progress)
+
+        warning = QLabel(
+            "Deleting removes only the builder's immutable snapshot copies. SteamCMD's "
+            "mutable cache is left intact. Other saved project files may still refer to "
+            "a deleted path, so deletion always requires confirmation."
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        self.snapshot_edit.editingFinished.connect(self.refresh_managed_downloads)
+        self.manager_root_label.setText(
+            f"Snapshot library: {Path(self.snapshot_edit.text()).expanduser()}"
+        )
         return panel
 
     def _upload_tab(self) -> QWidget:
@@ -1138,6 +1294,16 @@ class ModpackWindow(QMainWindow):
         self.log.appendPlainText(f"Project saved to {Path(path).resolve()}")
 
     def load_project_from(self, path: Path) -> None:
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self.log.appendPlainText(
+                "Project loading is unavailable while another operation is running."
+            )
+            return
         settings = load_project(path)
         self.name_edit.setText(settings.name)
         self.namespace_edit.setText(settings.namespace)
@@ -1160,6 +1326,7 @@ class ModpackWindow(QMainWindow):
         for source in settings.sources:
             self.add_source_path(source)
         self.included_mod_ids = settings.included_mod_ids
+        self._mod_selection_needs_review = False
         self.snapshot_selections = dict(settings.snapshot_selections)
         version_bump_index = self.version_bump_combo.findData(settings.version_bump)
         self.version_bump_combo.setCurrentIndex(
@@ -1168,6 +1335,7 @@ class ModpackWindow(QMainWindow):
         self._update_mod_selection_label()
         self.workshop_input.setPlainText("\n".join(settings.workshop_items))
         self._clear_transient_secrets()
+        self.refresh_managed_downloads()
         self.log.appendPlainText(f"Project loaded from {Path(path).resolve()}")
 
     def save_project_dialog(self) -> None:
@@ -1213,6 +1381,7 @@ class ModpackWindow(QMainWindow):
             self.source_list.addItem(resolved)
             if not preserve_mod_selection:
                 self.included_mod_ids = None
+                self._mod_selection_needs_review = False
                 self._update_mod_selection_label()
 
     def add_source_dialog(self) -> None:
@@ -1227,6 +1396,7 @@ class ModpackWindow(QMainWindow):
             removed = True
         if removed:
             self.included_mod_ids = None
+            self._mod_selection_needs_review = False
             try:
                 groups = workshop_snapshot_groups(
                     discover_mods(self.source_paths())
@@ -1243,6 +1413,750 @@ class ModpackWindow(QMainWindow):
                 )
             }
             self._update_mod_selection_label()
+
+    def _tab_changed(self, index: int) -> None:
+        if (
+            index == self.manager_tab_index
+            and not self._build_running
+            and not self._download_running
+            and not self._manager_delete_running
+            and not self._generic_operation_running
+        ):
+            self.refresh_managed_downloads()
+
+    @staticmethod
+    def _source_belongs_to_snapshot(source: Path, snapshot: Path) -> bool:
+        try:
+            Path(source).resolve().relative_to(Path(snapshot).resolve())
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _snapshot_is_attached(self, record: StoredWorkshopSnapshot) -> bool:
+        return any(
+            self._source_belongs_to_snapshot(source, record.path)
+            for source in self.source_paths()
+        )
+
+    def _steam_workshop_cache_root(self) -> Path:
+        return (
+            Path(self.library_edit.text()).expanduser()
+            / "steamapps"
+            / "workshop"
+            / "content"
+            / "108600"
+        )
+
+    def _validate_snapshot_root_separation(
+        self,
+        snapshot_root: Path | None = None,
+    ) -> None:
+        snapshot = (snapshot_root or Path(self.snapshot_edit.text()).expanduser()).resolve(
+            strict=False
+        )
+        cache = self._steam_workshop_cache_root().resolve(strict=False)
+        if (
+            snapshot == cache
+            or snapshot.is_relative_to(cache)
+            or cache.is_relative_to(snapshot)
+        ):
+            raise ValueError(
+                "the immutable snapshot library must be separate from SteamCMD's "
+                f"mutable Workshop cache ({cache})"
+            )
+
+    def _manager_selection_identity(self) -> tuple[str, str | None] | None:
+        item = self.manager_tree.currentItem()
+        if item is None:
+            return None
+        workshop_id = str(item.data(0, _MANAGED_WORKSHOP_ID_ROLE) or "")
+        if not workshop_id:
+            return None
+        revision = item.data(0, _MANAGED_REVISION_ROLE)
+        return workshop_id, str(revision) if revision else None
+
+    def _selected_managed_record(self) -> StoredWorkshopSnapshot | None:
+        identity = self._manager_selection_identity()
+        if identity is None or identity[1] is None:
+            return None
+        return self._managed_records.get((identity[0], identity[1]))
+
+    def _managed_records_for_item(
+        self,
+        workshop_id: str,
+    ) -> tuple[StoredWorkshopSnapshot, ...]:
+        return tuple(
+            record
+            for (candidate_id, _revision), record in self._managed_records.items()
+            if candidate_id == workshop_id
+        )
+
+    def refresh_managed_downloads(self) -> None:
+        if not hasattr(self, "manager_tree"):
+            return
+        if (
+            self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            return
+        previous_selection = (
+            self._manager_restore_selection or self._manager_selection_identity()
+        )
+        self._manager_restore_selection = None
+        snapshot_root = Path(self.snapshot_edit.text()).expanduser()
+        self.manager_root_label.setText(f"Snapshot library: {snapshot_root}")
+        self.manager_tree.clear()
+        self._managed_records = {}
+        try:
+            self._validate_snapshot_root_separation(snapshot_root)
+        except (OSError, ValueError) as error:
+            self.manager_summary_label.setText(f"Unsafe snapshot library setting: {error}")
+            self.manager_details.clear()
+            self._update_manager_action_buttons()
+            return
+        try:
+            inventory = list_stored_workshop_snapshots(snapshot_root)
+        except (OSError, ValueError) as error:
+            self.manager_summary_label.setText(
+                f"Could not read the snapshot library: {error}"
+            )
+            self.manager_details.clear()
+            self._update_manager_action_buttons()
+            return
+        inventory_warnings = list(inventory.warnings)
+
+        grouped: dict[str, list[StoredWorkshopSnapshot]] = {}
+        for record in inventory.snapshots:
+            grouped.setdefault(record.workshop_id, []).append(record)
+            self._managed_records[
+                (record.workshop_id, record.revision_directory)
+            ] = record
+
+        cache_root = self._steam_workshop_cache_root()
+        cache_items: dict[str, Path] = {}
+        if cache_root.is_dir():
+            try:
+                cache_items = {
+                    path.name: path
+                    for path in cache_root.iterdir()
+                    if path.is_dir() and path.name.isdigit()
+                }
+            except OSError as error:
+                inventory_warnings.append(
+                    f"Could not inspect SteamCMD cache: {error}"
+                )
+        for workshop_id in cache_items:
+            grouped.setdefault(workshop_id, [])
+
+        selected_item: QTreeWidgetItem | None = None
+        for workshop_id in sorted(grouped, key=int):
+            records = grouped[workshop_id]
+            latest = records[0] if records else None
+            cached_path = cache_items.get(workshop_id)
+            cached_mods_root = cached_path / "mods" if cached_path else None
+            cached_folders: tuple[str, ...] = ()
+            if cached_mods_root is not None and cached_mods_root.is_dir():
+                try:
+                    cached_folders = tuple(
+                        sorted(
+                            path.name
+                            for path in cached_mods_root.iterdir()
+                            if path.is_dir()
+                        )
+                    )
+                except OSError:
+                    cached_folders = ()
+            mod_summary = ", ".join(
+                latest.mod_folders if latest is not None else cached_folders
+            ) or "No mod folders detected"
+            attached_count = sum(self._snapshot_is_attached(record) for record in records)
+            cached = cached_path is not None
+            parent_status = [f"{len(records)} snapshot(s)"]
+            if attached_count:
+                parent_status.append(f"{attached_count} in current pack")
+            parent_status.append("SteamCMD cache present" if cached else "Snapshot only")
+            parent = QTreeWidgetItem(
+                (
+                    f"Workshop {workshop_id}",
+                    mod_summary,
+                    _display_snapshot_time(
+                        latest.workshop_updated_at_utc if latest else None
+                    ),
+                    _display_snapshot_time(
+                        latest.snapshot_created_at_utc if latest else None
+                    ),
+                    latest.workshop_manifest_id
+                    if latest and latest.workshop_manifest_id
+                    else "Unknown",
+                    "; ".join(parent_status),
+                )
+            )
+            parent.setData(0, _MANAGED_KIND_ROLE, "item")
+            parent.setData(0, _MANAGED_WORKSHOP_ID_ROLE, workshop_id)
+            self.manager_tree.addTopLevelItem(parent)
+
+            for index, record in enumerate(records):
+                attached = self._snapshot_is_attached(record)
+                selected_revision = self.snapshot_selections.get(workshop_id)
+                selected = selected_revision in {
+                    record.sha256,
+                    f"path:{record.path.as_posix()}",
+                }
+                statuses: list[str] = []
+                if index == 0:
+                    statuses.append("Latest stored")
+                if attached:
+                    statuses.append("In current pack")
+                if selected and attached:
+                    statuses.append(
+                        "Selected latest" if index == 0 else "Pinned older"
+                    )
+                elif selected:
+                    statuses.append("Selected source missing")
+                elif attached and index == 0 and selected_revision is None:
+                    statuses.append("Build default")
+                if record.metadata_state == "legacy":
+                    statuses.append("Legacy metadata")
+                elif record.metadata_state != "valid":
+                    statuses.append("Metadata warning")
+                child = QTreeWidgetItem(
+                    (
+                        record.sha256[:16]
+                        if record.sha256
+                        else record.revision_directory,
+                        ", ".join(record.mod_folders) or "No mod folders detected",
+                        _display_snapshot_time(record.workshop_updated_at_utc),
+                        _display_snapshot_time(record.snapshot_created_at_utc),
+                        record.workshop_manifest_id or "Unknown",
+                        "; ".join(statuses) or "Stored",
+                    )
+                )
+                child.setData(0, _MANAGED_KIND_ROLE, "snapshot")
+                child.setData(0, _MANAGED_WORKSHOP_ID_ROLE, workshop_id)
+                child.setData(
+                    0,
+                    _MANAGED_REVISION_ROLE,
+                    record.revision_directory,
+                )
+                tooltip = (
+                    f"Path: {record.path}\n"
+                    f"Full SHA-256: {record.sha256 or 'Unavailable'}\n"
+                    f"Metadata: {record.metadata_message or record.metadata_state}"
+                )
+                for column in range(6):
+                    child.setToolTip(column, tooltip)
+                parent.addChild(child)
+                if previous_selection == (
+                    workshop_id,
+                    record.revision_directory,
+                ):
+                    selected_item = child
+            if previous_selection == (workshop_id, None):
+                selected_item = parent
+            parent.setExpanded(True)
+
+        snapshot_count = len(inventory.snapshots)
+        summary = (
+            f"{len(grouped)} Workshop item(s), {snapshot_count} immutable snapshot(s)."
+        )
+        if inventory_warnings:
+            summary += (
+                f" {len(inventory_warnings)} storage warning(s); hover for details."
+            )
+            self.manager_summary_label.setToolTip("\n".join(inventory_warnings))
+        else:
+            self.manager_summary_label.setToolTip("")
+        if not snapshot_count:
+            if grouped:
+                summary = (
+                    f"No immutable snapshots found; {len(grouped)} SteamCMD cache "
+                    "item(s) are shown."
+                )
+            else:
+                summary = f"No stored Workshop snapshots found in {snapshot_root}."
+            if inventory_warnings:
+                summary += f" {len(inventory_warnings)} storage warning(s)."
+        self.manager_summary_label.setText(summary)
+        if selected_item is not None:
+            self.manager_tree.setCurrentItem(selected_item)
+        else:
+            self.manager_details.clear()
+        self._managed_selection_changed()
+
+    def _managed_selection_changed(self) -> None:
+        identity = self._manager_selection_identity()
+        if identity is None:
+            self.manager_details.clear()
+            self._update_manager_action_buttons()
+            return
+        workshop_id, revision = identity
+        if revision is None:
+            records = self._managed_records_for_item(workshop_id)
+            attached = sum(self._snapshot_is_attached(record) for record in records)
+            self.manager_details.setPlainText(
+                f"Workshop item: {workshop_id}\n"
+                f"Stored snapshots: {len(records)}\n"
+                f"Attached to current pack: {attached}\n"
+                "Update checks this item through SteamCMD and keeps every older "
+                "immutable revision."
+            )
+        else:
+            record = self._managed_records.get((workshop_id, revision))
+            if record is None:
+                self.manager_details.clear()
+            else:
+                self.manager_details.setPlainText(
+                    f"Workshop item: {record.workshop_id}\n"
+                    f"Snapshot path: {record.path}\n"
+                    f"Full SHA-256: {record.sha256 or 'Unavailable'}\n"
+                    f"Workshop manifest: {record.workshop_manifest_id or 'Unknown'}\n"
+                    f"Workshop updated: "
+                    f"{_display_snapshot_time(record.workshop_updated_at_utc)}\n"
+                    f"Snapshot captured: "
+                    f"{_display_snapshot_time(record.snapshot_created_at_utc)}\n"
+                    f"Metadata: {record.metadata_message or record.metadata_state}"
+                )
+        self._update_manager_action_buttons()
+
+    def _update_manager_action_buttons(self) -> None:
+        if not hasattr(self, "manager_update_button"):
+            return
+        identity = self._manager_selection_identity()
+        record = self._selected_managed_record()
+        item_records = (
+            self._managed_records_for_item(identity[0])
+            if identity is not None
+            else ()
+        )
+        busy = (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        )
+        self.manager_update_button.setEnabled(identity is not None and not busy)
+        self.manager_add_button.setEnabled(
+            record is not None and record.is_valid and not busy
+        )
+        self.manager_delete_snapshot_button.setEnabled(
+            record is not None and record.is_deletable and not busy
+        )
+        self.manager_delete_item_button.setEnabled(
+            bool(item_records)
+            and all(record.is_deletable for record in item_records)
+            and not busy
+        )
+        self.manager_refresh_button.setEnabled(not busy)
+
+    def _update_operation_controls(self) -> None:
+        busy = (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        )
+        if hasattr(self, "build_button"):
+            self.build_button.setEnabled(not busy)
+        if hasattr(self, "download_button"):
+            self.download_button.setEnabled(not busy)
+        for button_name in (
+            "open_project_button",
+            "save_project_button",
+            "select_bundled_mods_button",
+            "add_source_button",
+            "remove_source_button",
+            "scan_button",
+            "browse_preview_button",
+            "browse_output_button",
+            "browse_steamcmd_button",
+            "install_steamcmd_button",
+            "test_login_button",
+            "forget_login_button",
+        ):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.setEnabled(not busy)
+        for editor_name in (
+            "name_edit",
+            "namespace_edit",
+            "workshop_edit",
+            "description_edit",
+            "output_edit",
+            "preview_edit",
+            "visibility_combo",
+            "version_bump_combo",
+            "active_ids_edit",
+            "source_list",
+            "workshop_input",
+            "upload_change_edit",
+        ):
+            editor = getattr(self, editor_name, None)
+            if editor is not None:
+                editor.setEnabled(not busy)
+        for field_name in ("steamcmd_edit", "library_edit", "snapshot_edit"):
+            field = getattr(self, field_name, None)
+            if field is not None:
+                field.setEnabled(not busy)
+        credential_busy = self._download_running or self._generic_operation_running
+        if hasattr(self, "anonymous_check"):
+            self.anonymous_check.setEnabled(not credential_busy)
+        if hasattr(self, "username_edit"):
+            credential_fields_enabled = (
+                not self.anonymous_check.isChecked() and not credential_busy
+            )
+            for field in (self.username_edit, self.password_edit, self.guard_edit):
+                field.setEnabled(credential_fields_enabled)
+        if hasattr(self, "upload_permission_check"):
+            self.upload_permission_check.setEnabled(not busy)
+        self._update_manager_action_buttons()
+        self._update_upload_button()
+
+    def _effective_project_revision(self, workshop_id: str) -> str | None:
+        records = tuple(
+            record
+            for record in self._managed_records_for_item(workshop_id)
+            if self._snapshot_is_attached(record)
+        )
+        if not records:
+            return None
+        requested = self.snapshot_selections.get(workshop_id)
+        if requested is not None and any(
+            requested
+            in {
+                record.sha256,
+                f"path:{record.path.as_posix()}",
+            }
+            for record in records
+        ):
+            return requested
+        first = records[0]
+        return first.sha256 or f"path:{first.path.as_posix()}"
+
+    def add_managed_snapshot_to_pack(self) -> None:
+        record = self._selected_managed_record()
+        if record is None or not record.is_valid or record.sha256 is None:
+            self.log.appendPlainText(
+                "Snapshot attach failed: select a snapshot with valid metadata."
+            )
+            return
+        effective_before = self._effective_project_revision(record.workshop_id)
+        already_attached = self._snapshot_is_attached(record)
+        self.add_source_path(record.path, preserve_mod_selection=True)
+        self.snapshot_selections[record.workshop_id] = record.sha256
+        if (
+            effective_before != record.sha256
+            and self.included_mod_ids is not None
+        ):
+            self._mod_selection_needs_review = True
+        self._update_mod_selection_label()
+        self._manager_restore_selection = (
+            record.workshop_id,
+            record.revision_directory,
+        )
+        self.refresh_managed_downloads()
+        action = "Selected" if already_attached else "Added"
+        self.log.appendPlainText(
+            f"{action} Workshop {record.workshop_id} snapshot "
+            f"{record.sha256[:12]} for the current pack. Reopen bundled mod "
+            "selection if this revision changes the available folders or Mod IDs."
+        )
+
+    def update_managed_workshop_item(self) -> None:
+        identity = self._manager_selection_identity()
+        if identity is None:
+            self.log.appendPlainText(
+                "Workshop update failed: select a Workshop item or snapshot."
+            )
+            return
+        workshop_id = identity[0]
+        attached_ids = {
+            workshop_id
+            for record in self._managed_records_for_item(workshop_id)
+            if self._snapshot_is_attached(record)
+        }
+        self.log.clear()
+        self.log.appendPlainText(
+            f"Checking Workshop {workshop_id} for an updated snapshot..."
+        )
+        self._start_workshop_download(
+            (workshop_id,),
+            attach_workshop_ids=attached_ids,
+            manager=True,
+        )
+
+    def _confirm_snapshot_deletion(
+        self,
+        title: str,
+        message: str,
+    ) -> bool:
+        answer = QMessageBox.question(
+            self,
+            title,
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def delete_managed_snapshot(self) -> None:
+        record = self._selected_managed_record()
+        if record is None or not record.is_deletable:
+            self.log.appendPlainText(
+                "Snapshot deletion failed: select an individual hash-named snapshot."
+            )
+            return
+        attached = self._snapshot_is_attached(record)
+        selected = self.snapshot_selections.get(record.workshop_id) in {
+            record.sha256,
+            f"path:{record.path.as_posix()}",
+        }
+        usage = []
+        if attached:
+            usage.append("It is attached to the current pack.")
+        if selected:
+            usage.append("It is the selected revision for the current pack.")
+        if not usage:
+            usage.append("It is not currently attached to this pack.")
+        effective_before = self._effective_project_revision(record.workshop_id)
+        record_keys = {
+            record.sha256,
+            f"path:{record.path.as_posix()}",
+        }
+        fallback_note = ""
+        if effective_before in record_keys:
+            remaining = tuple(
+                candidate
+                for candidate in self._managed_records_for_item(record.workshop_id)
+                if candidate.revision_directory != record.revision_directory
+                and candidate.is_valid
+            )
+            if remaining and remaining[0].sha256:
+                fallback_note = (
+                    f" The current pack will switch to the latest remaining snapshot "
+                    f"{remaining[0].sha256[:12]}."
+                )
+            else:
+                fallback_note = (
+                    " The Workshop item will be removed from the current pack because "
+                    "no valid snapshot will remain."
+                )
+        elif selected and effective_before is not None:
+            fallback_note = (
+                " The stale selection will be cleared; the currently attached "
+                f"revision {effective_before.removeprefix('path:')[:12]} will remain."
+            )
+        message = (
+            f"Delete Workshop {record.workshop_id} snapshot\n\n"
+            f"{record.sha256 or record.revision_directory}\n{record.path}\n\n"
+            f"{' '.join(usage)}{fallback_note} The SteamCMD cache will not be deleted. Other saved "
+            "project files may still reference this path. This cannot be undone."
+        )
+        if not self._confirm_snapshot_deletion("Delete immutable snapshot?", message):
+            return
+        snapshot_root = Path(self.snapshot_edit.text()).expanduser()
+        self._start_managed_deletion(
+            record.workshop_id,
+            effective_before,
+            lambda: delete_stored_workshop_snapshot(
+                snapshot_root,
+                record.workshop_id,
+                record.revision_directory,
+            ),
+        )
+
+    def delete_managed_workshop_item(self) -> None:
+        identity = self._manager_selection_identity()
+        if identity is None:
+            self.log.appendPlainText(
+                "Workshop deletion failed: select a Workshop item or snapshot."
+            )
+            return
+        workshop_id = identity[0]
+        records = self._managed_records_for_item(workshop_id)
+        if not records or not all(record.is_deletable for record in records):
+            self.log.appendPlainText(
+                f"Workshop deletion failed: Workshop {workshop_id} contains an "
+                "unrecognized storage entry and cannot be deleted as a group."
+            )
+            return
+        attached_count = sum(self._snapshot_is_attached(record) for record in records)
+        message = (
+            f"Delete all {len(records)} immutable snapshot(s) for Workshop "
+            f"{workshop_id}?\n\n{attached_count} snapshot(s) are attached to the "
+            "current pack. If attached, this Workshop item will be removed from the "
+            "current pack. The SteamCMD cache will not be deleted. Other saved project "
+            "files may still reference these paths. This cannot be undone."
+        )
+        if not self._confirm_snapshot_deletion(
+            "Delete all snapshots for this item?",
+            message,
+        ):
+            return
+        effective_before = self._effective_project_revision(workshop_id)
+        snapshot_root = Path(self.snapshot_edit.text()).expanduser()
+        self._start_managed_deletion(
+            workshop_id,
+            effective_before,
+            lambda: delete_all_stored_workshop_snapshots(
+                snapshot_root,
+                workshop_id,
+            ),
+        )
+
+    def _set_manager_delete_running(self, running: bool) -> None:
+        self._manager_delete_running = running
+        self.manager_progress.setVisible(running)
+        self.manager_operation_status.setVisible(running)
+        if running:
+            self.manager_progress.setRange(0, 0)
+            self.manager_operation_status.setText("Deleting immutable snapshot data...")
+        else:
+            self.manager_progress.setRange(0, 100)
+            self.manager_progress.setValue(0)
+        self._update_operation_controls()
+
+    def _start_managed_deletion(
+        self,
+        workshop_id: str,
+        effective_before: str | None,
+        operation: Callable[[], object],
+    ) -> None:
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self.log.appendPlainText(
+                "Snapshot deletion is unavailable while another operation is running."
+            )
+            return
+        try:
+            self._validate_snapshot_root_separation()
+        except (OSError, ValueError) as error:
+            self.log.appendPlainText(f"Snapshot deletion refused: {error}")
+            return
+        self.log.clear()
+        self._set_manager_delete_running(True)
+
+        def completed(result: object) -> None:
+            self._set_manager_delete_running(False)
+            deleted_paths = tuple(getattr(result, "deleted_paths", ()))
+            self.log.appendPlainText(
+                f"Deleted {len(deleted_paths)} immutable snapshot(s) for Workshop "
+                f"{workshop_id}. SteamCMD's cache was left unchanged."
+            )
+            try:
+                self._reconcile_project_after_snapshot_deletion(
+                    workshop_id,
+                    effective_before,
+                )
+                self.refresh_managed_downloads()
+            except (OSError, ValueError) as error:
+                self.log.appendPlainText(
+                    "Snapshot files were deleted, but project reconciliation failed: "
+                    f"{error}. Refresh the manager and review project sources before "
+                    "building."
+                )
+
+        def failed(message: str) -> None:
+            self._set_manager_delete_running(False)
+            self.log.appendPlainText(f"Snapshot deletion failed: {message}")
+            try:
+                self._reconcile_project_after_snapshot_deletion(
+                    workshop_id,
+                    effective_before,
+                )
+                self.refresh_managed_downloads()
+            except (OSError, ValueError) as error:
+                self.log.appendPlainText(
+                    f"Snapshot state refresh also failed: {error}. Review the "
+                    "snapshot library before building."
+                )
+
+        self._execute(
+            operation,
+            completed,
+            "Snapshot deletion failed",
+            on_failure=failed,
+        )
+
+    def _reconcile_project_after_snapshot_deletion(
+        self,
+        workshop_id: str,
+        effective_before: str | None,
+    ) -> None:
+        item_root = (
+            Path(self.snapshot_edit.text()).expanduser().resolve()
+            / workshop_id
+        )
+        removed_sources = 0
+        for index in range(self.source_list.count() - 1, -1, -1):
+            source = Path(self.source_list.item(index).text())
+            try:
+                belongs_to_item = source.resolve().is_relative_to(item_root)
+            except OSError:
+                belongs_to_item = False
+            if belongs_to_item and not source.exists():
+                self.source_list.takeItem(index)
+                removed_sources += 1
+
+        inventory = list_stored_workshop_snapshots(
+            Path(self.snapshot_edit.text()).expanduser()
+        )
+        remaining = tuple(
+            record
+            for record in inventory.snapshots
+            if record.workshop_id == workshop_id and record.is_valid
+        )
+        remaining_keys = {
+            key
+            for record in remaining
+            for key in (
+                record.sha256,
+                f"path:{record.path.as_posix()}",
+            )
+            if key
+        }
+        current_selection = self.snapshot_selections.get(workshop_id)
+        effective_removed = (
+            effective_before is not None and effective_before not in remaining_keys
+        )
+        selection_removed = (
+            current_selection is not None and current_selection not in remaining_keys
+        )
+        if effective_removed:
+            if remaining and remaining[0].sha256:
+                fallback = remaining[0]
+                self.add_source_path(fallback.path, preserve_mod_selection=True)
+                self.snapshot_selections[workshop_id] = fallback.sha256
+                self._manager_restore_selection = (
+                    workshop_id,
+                    fallback.revision_directory,
+                )
+                self.log.appendPlainText(
+                    f"Workshop {workshop_id} now uses latest remaining snapshot "
+                    f"{fallback.sha256[:12]}."
+                )
+            else:
+                self.snapshot_selections.pop(workshop_id, None)
+            self._mod_selection_needs_review = self.included_mod_ids is not None
+        elif selection_removed:
+            self.snapshot_selections.pop(workshop_id, None)
+            self.log.appendPlainText(
+                f"Cleared the deleted stale selection for Workshop {workshop_id}; "
+                "the attached snapshot did not change."
+            )
+        elif not remaining and removed_sources:
+            self.snapshot_selections.pop(workshop_id, None)
+            self._mod_selection_needs_review = self.included_mod_ids is not None
+        if removed_sources:
+            self.log.appendPlainText(
+                f"Removed {removed_sources} deleted snapshot source path(s) from "
+                "the current project."
+            )
+        self._update_mod_selection_label()
 
     def choose_output(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select output parent directory")
@@ -1312,6 +2226,16 @@ class ModpackWindow(QMainWindow):
         )
 
     def forget_saved_steam_account(self) -> None:
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self.log.appendPlainText(
+                "Steam account changes are unavailable while another operation is running."
+            )
+            return
         if self.persist_session:
             clear_steam_session(self.session_file)
         self.username_edit.clear()
@@ -1333,7 +2257,12 @@ class ModpackWindow(QMainWindow):
             and self.upload_permission_check.isChecked()
         )
         self.upload_button.setEnabled(
-            not self.anonymous_check.isChecked() and confirmed
+            not self.anonymous_check.isChecked()
+            and confirmed
+            and not self._build_running
+            and not self._download_running
+            and not self._manager_delete_running
+            and not self._generic_operation_running
         )
 
     def steam_credentials(self) -> SteamCredentials:
@@ -1355,55 +2284,122 @@ class ModpackWindow(QMainWindow):
         self.password_edit.clear()
         self.guard_edit.clear()
 
+    def _set_generic_operation_running(self, running: bool) -> None:
+        self._generic_operation_running = running
+        self._update_operation_controls()
+
     def _execute(
         self,
         operation: Callable[[], object],
         on_success: Callable[[object], None],
         failure_prefix: str,
+        *,
+        on_failure: Callable[[str], None] | None = None,
     ) -> None:
         if not self.run_async:
             try:
                 on_success(operation())
             except Exception as error:  # noqa: BLE001 - synchronous test boundary mirrors worker.
-                self.log.appendPlainText(f"{failure_prefix}: {error}")
+                if on_failure is not None:
+                    on_failure(str(error))
+                else:
+                    self.log.appendPlainText(f"{failure_prefix}: {error}")
             return
         worker = OperationWorker(operation)
         self._workers.add(worker)
         worker.succeeded.connect(on_success)
-        worker.failed.connect(lambda message: self.log.appendPlainText(f"{failure_prefix}: {message}"))
+        if on_failure is not None:
+            worker.failed.connect(on_failure)
+        else:
+            worker.failed.connect(
+                lambda message: self.log.appendPlainText(
+                    f"{failure_prefix}: {message}"
+                )
+            )
         worker.finished.connect(lambda: self._workers.discard(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API name.
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+            or self._workers
+        ):
+            self.log.appendPlainText(
+                "Wait for the active operation to finish before closing the application."
+            )
+            QMessageBox.warning(
+                self,
+                "Operation still running",
+                "A build, SteamCMD action, or snapshot deletion is still running. "
+                "Wait for it to finish before closing so files are not left incomplete.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def install_managed_steamcmd(self) -> None:
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self.log.appendPlainText(
+                "SteamCMD installation is unavailable while another operation is running."
+            )
+            return
         self.log.clear()
         destination = Path(self.steamcmd_edit.text()).expanduser().parent
+        self._set_generic_operation_running(True)
 
         def installed(executable: object) -> None:
+            self._set_generic_operation_running(False)
             path = Path(str(executable))
             self.steamcmd_edit.setText(str(path))
             self.log.appendPlainText(f"SteamCMD installed at {path}")
+
+        def failed(message: str) -> None:
+            self._set_generic_operation_running(False)
+            self.log.appendPlainText(f"SteamCMD installation failed: {message}")
 
         self.log.appendPlainText("Installing SteamCMD from Valve...")
         self._execute(
             lambda: install_steamcmd(destination),
             installed,
             "SteamCMD installation failed",
+            on_failure=failed,
         )
 
     def test_steam_login(self) -> None:
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self.log.appendPlainText(
+                "Steam login testing is unavailable while another operation is running."
+            )
+            return
         self.log.clear()
         credentials = self.steam_credentials()
         client = self.steam_client()
+        username = self.username_edit.text().strip()
         self._clear_transient_secrets()
+        self._set_generic_operation_running(True)
 
         def completed(result: object) -> None:
+            self._set_generic_operation_running(False)
             steam_result = result
             self.log.appendPlainText(steam_result.output.strip())
             if steam_result.success:
                 self._save_current_steam_session()
                 self._update_login_status(
-                    f"Cached SteamCMD account: {self.username_edit.text().strip()}"
+                    f"Cached SteamCMD account: {username}"
                 )
                 self.log.appendPlainText(
                     "Steam login succeeded. SteamCMD will reuse its cached account session."
@@ -1413,6 +2409,11 @@ class ModpackWindow(QMainWindow):
                 self.log.appendPlainText(
                     f"Steam login failed with exit code {steam_result.return_code}."
                 )
+
+        def failed(message: str) -> None:
+            self._set_generic_operation_running(False)
+            self._update_login_status("SteamCMD login failed; account was not saved")
+            self.log.appendPlainText(f"Steam login failed: {message}")
 
         self.log.appendPlainText(
             f"PZ Modpack Builder v{__version__} Steam login check"
@@ -1425,13 +2426,11 @@ class ModpackWindow(QMainWindow):
             lambda: client.test_login(credentials, timeout=90),
             completed,
             "Steam login failed",
+            on_failure=failed,
         )
 
     def download_workshop_items(self) -> None:
         self.log.clear()
-        credentials = self.steam_credentials()
-        client = self.steam_client()
-        snapshot_root = Path(self.snapshot_edit.text()).expanduser()
         try:
             workshop_ids = parse_workshop_ids(self.workshop_input.toPlainText().splitlines())
             if not workshop_ids:
@@ -1440,22 +2439,86 @@ class ModpackWindow(QMainWindow):
             self._clear_transient_secrets()
             self.log.appendPlainText(f"Workshop download failed: {error}")
             return
+        self.log.appendPlainText(
+            f"Downloading {len(workshop_ids)} Workshop item(s) through SteamCMD..."
+        )
+        self._start_workshop_download(
+            workshop_ids,
+            attach_workshop_ids=set(workshop_ids),
+            manager=False,
+        )
+
+    def _start_workshop_download(
+        self,
+        workshop_ids: tuple[str, ...],
+        *,
+        attach_workshop_ids: set[str],
+        manager: bool,
+    ) -> None:
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self._clear_transient_secrets()
+            self.log.appendPlainText(
+                "Workshop download is unavailable while another operation is running."
+            )
+            return
+        credentials = self.steam_credentials()
+        client = self.steam_client()
+        snapshot_root = Path(self.snapshot_edit.text()).expanduser()
+        try:
+            self._validate_snapshot_root_separation(snapshot_root)
+        except (OSError, ValueError) as error:
+            self._clear_transient_secrets()
+            self.log.appendPlainText(f"Workshop download failed: {error}")
+            return
         self._clear_transient_secrets()
+        self._set_download_running(True, manager=manager)
+        snapshot_roots = {snapshot_root.resolve()}
+        for source in self.source_paths():
+            for candidate in (source, *source.parents):
+                if (
+                    (candidate / "snapshot.json").is_file()
+                    and candidate.parent.name.isdigit()
+                ):
+                    snapshot_roots.add(candidate.parent.parent.resolve())
+                    break
+        previous_records: dict[str, list[StoredWorkshopSnapshot]] = {}
+        try:
+            for root in sorted(snapshot_roots, key=str):
+                inventory = list_stored_workshop_snapshots(root)
+                for record in inventory.snapshots:
+                    if record.is_valid and self._snapshot_is_attached(record):
+                        previous_records.setdefault(record.workshop_id, []).append(
+                            record
+                        )
+        except (OSError, ValueError) as error:
+            self._set_download_running(False, manager=manager)
+            self.log.appendPlainText(
+                f"Workshop download failed while reading current snapshot state: {error}"
+            )
+            return
+        for records in previous_records.values():
+            records.sort(key=_stored_snapshot_sort_key, reverse=True)
 
         def completed(result: object) -> None:
-            self._set_download_running(False)
+            self._set_download_running(False, manager=manager)
             batch = result
-            self.log.appendPlainText(batch.command_result.output.strip())
+            command_output = batch.command_result.output.strip()
+            if command_output:
+                self.log.appendPlainText(command_output)
             if not batch.command_result.success:
                 self.log.appendPlainText("SteamCMD did not complete the download successfully.")
+                self.refresh_managed_downloads()
                 return
-            existing_groups = workshop_snapshot_groups(
-                discover_mods(self.source_paths())
-            )
             for snapshot in batch.snapshots:
-                previous_revisions = existing_groups.get(snapshot.workshop_id, ())
+                previous_revisions = previous_records.get(snapshot.workshop_id, ())
                 previous_latest = (
-                    previous_revisions[0].revision_key
+                    previous_revisions[0].sha256
+                    or f"path:{previous_revisions[0].path.as_posix()}"
                     if previous_revisions
                     else None
                 )
@@ -1466,29 +2529,46 @@ class ModpackWindow(QMainWindow):
                     previous_selection is None
                     or previous_selection == previous_latest
                 )
-                self.add_source_path(
-                    snapshot.path,
-                    preserve_mod_selection=bool(previous_revisions),
+                if snapshot.workshop_id in attach_workshop_ids:
+                    self.add_source_path(
+                        snapshot.path,
+                        preserve_mod_selection=True,
+                    )
+                    if followed_latest:
+                        if (
+                            previous_latest != snapshot.sha256
+                            and self.included_mod_ids is not None
+                        ):
+                            self._mod_selection_needs_review = True
+                        self.snapshot_selections[
+                            snapshot.workshop_id
+                        ] = snapshot.sha256
+                snapshot_state = (
+                    "new immutable snapshot"
+                    if snapshot.created
+                    else "existing snapshot already current"
                 )
-                if followed_latest:
-                    self.snapshot_selections[snapshot.workshop_id] = snapshot.sha256
                 self.log.appendPlainText(
                     f"Locked Workshop {snapshot.workshop_id} as "
-                    f"{snapshot.sha256[:16]} at {snapshot.path}\n"
+                    f"{snapshot.sha256[:16]} at {snapshot.path} "
+                    f"({snapshot_state})\n"
                     f"  Workshop updated: "
                     f"{_display_snapshot_time(snapshot.workshop_updated_at_utc)}\n"
                     f"  Snapshot captured: "
                     f"{_display_snapshot_time(snapshot.snapshot_created_at_utc)}"
                 )
+                self._manager_restore_selection = (
+                    snapshot.workshop_id,
+                    snapshot.path.name,
+                )
+            self._update_mod_selection_label()
+            self.refresh_managed_downloads()
 
         def failed(message: str) -> None:
-            self._set_download_running(False)
+            self._set_download_running(False, manager=manager)
+            self.refresh_managed_downloads()
             self.log.appendPlainText(f"Workshop download failed: {message}")
 
-        self.log.appendPlainText(
-            f"Downloading {len(workshop_ids)} Workshop item(s) through SteamCMD..."
-        )
-        self._set_download_running(True)
         if not self.run_async:
             try:
                 result = download_and_snapshot(
@@ -1518,14 +2598,22 @@ class ModpackWindow(QMainWindow):
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _set_download_running(self, running: bool) -> None:
-        self.download_button.setEnabled(not running)
-        self.download_progress.setVisible(running)
-        self.download_status.setVisible(running)
+    def _set_download_running(self, running: bool, *, manager: bool = False) -> None:
+        self._download_running = running
+        self._download_in_manager = manager if running else False
+        self.download_progress.setVisible(running and not manager)
+        self.download_status.setVisible(running and not manager)
+        self.manager_progress.setVisible(running and manager)
+        self.manager_operation_status.setVisible(running and manager)
         if running:
-            self.download_progress.setRange(0, 100)
-            self.download_progress.setValue(0)
-            self.download_status.setText("Starting Workshop download...")
+            progress = self.manager_progress if manager else self.download_progress
+            status = (
+                self.manager_operation_status if manager else self.download_status
+            )
+            progress.setRange(0, 100)
+            progress.setValue(0)
+            status.setText("Starting Workshop update..." if manager else "Starting Workshop download...")
+        self._update_operation_controls()
 
     def _update_download_progress(
         self,
@@ -1533,11 +2621,29 @@ class ModpackWindow(QMainWindow):
         total: int,
         message: str,
     ) -> None:
-        self.download_progress.setRange(0, max(total, 1))
-        self.download_progress.setValue(current)
-        self.download_status.setText(message)
+        progress = (
+            self.manager_progress if self._download_in_manager else self.download_progress
+        )
+        status = (
+            self.manager_operation_status
+            if self._download_in_manager
+            else self.download_status
+        )
+        progress.setRange(0, max(total, 1))
+        progress.setValue(current)
+        status.setText(message)
 
     def upload_built_modpack(self) -> None:
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self.log.appendPlainText(
+                "Workshop upload is unavailable while another operation is running."
+            )
+            return
         self.log.clear()
         if self.anonymous_check.isChecked():
             self.log.appendPlainText(
@@ -1560,8 +2666,10 @@ class ModpackWindow(QMainWindow):
         client = self.steam_client()
         output = Path(self.output_edit.text()).expanduser().resolve()
         self._clear_transient_secrets()
+        self._set_generic_operation_running(True)
 
         def completed(result: object) -> None:
+            self._set_generic_operation_running(False)
             upload_result = result
             self.log.appendPlainText(upload_result.command_result.output.strip())
             if not upload_result.command_result.success:
@@ -1575,6 +2683,10 @@ class ModpackWindow(QMainWindow):
             )
             self.upload_permission_check.setChecked(False)
 
+        def failed(message: str) -> None:
+            self._set_generic_operation_running(False)
+            self.log.appendPlainText(f"Workshop upload failed: {message}")
+
         self.log.appendPlainText(f"Uploading generated pack from {output}...")
         self._execute(
             lambda: upload_modpack(
@@ -1585,6 +2697,7 @@ class ModpackWindow(QMainWindow):
             ),
             completed,
             "Workshop upload failed",
+            on_failure=failed,
         )
 
     def _update_mod_selection_label(self) -> None:
@@ -1599,6 +2712,8 @@ class ModpackWindow(QMainWindow):
                 f"; {len(self.snapshot_selections)} Workshop snapshot revision(s) "
                 "chosen"
             )
+        if self._mod_selection_needs_review:
+            label += "; bundled selection review required"
         self.mod_selection_label.setText(label)
 
     def _snapshot_selections_need_review(
@@ -1657,7 +2772,7 @@ class ModpackWindow(QMainWindow):
             selected_revisions,
         )
         if effective != previous_effective:
-            self.included_mod_ids = None
+            self._mod_selection_needs_review = self.included_mod_ids is not None
             self._update_mod_selection_label()
         self.snapshot_selections = selected_revisions
         self._update_mod_selection_label()
@@ -1688,6 +2803,7 @@ class ModpackWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return False
         self.included_mod_ids = dialog.selected_mod_ids()
+        self._mod_selection_needs_review = False
         self._update_mod_selection_label()
         selected_count = len(select_mods(mods, self.included_mod_ids))
         self.log.appendPlainText(
@@ -1783,13 +2899,14 @@ class ModpackWindow(QMainWindow):
             )
 
     def _set_build_running(self, running: bool) -> None:
-        self.build_button.setEnabled(not running)
+        self._build_running = running
         self.build_progress.setVisible(running)
         self.build_status.setVisible(running)
         if running:
             self.build_progress.setRange(0, 100)
             self.build_progress.setValue(0)
             self.build_status.setText("Starting build...")
+        self._update_operation_controls()
 
     def _update_build_progress(self, current: int, total: int, message: str) -> None:
         self.build_progress.setRange(0, max(total, 1))
@@ -1843,6 +2960,16 @@ class ModpackWindow(QMainWindow):
 
     def build_pack(self) -> None:
         self.log.clear()
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self.log.appendPlainText(
+                "Build failed: wait for the active operation to finish."
+            )
+            return
         if not self.source_paths():
             self.log.appendPlainText("Build failed: add at least one source folder.")
             return
@@ -1870,7 +2997,12 @@ class ModpackWindow(QMainWindow):
                 for issue in selection_issues
                 if issue.code in {"excluded_required_mod", "missing_required_mod"}
             ]
-            if not selected_mods or selected_conflicts or requirement_issues:
+            if (
+                not selected_mods
+                or selected_conflicts
+                or requirement_issues
+                or self._mod_selection_needs_review
+            ):
                 if selected_conflicts:
                     self.log.appendPlainText(
                         f"Choose bundled variants to resolve "
@@ -1880,6 +3012,11 @@ class ModpackWindow(QMainWindow):
                     self.log.appendPlainText(
                         f"Review {len(requirement_issues)} required-mod issue(s) before "
                         "building."
+                    )
+                if self._mod_selection_needs_review:
+                    self.log.appendPlainText(
+                        "The selected snapshot changed; review bundled folders and "
+                        "required mods before building."
                     )
                 if not self._show_bundled_mod_selection_dialog(
                     discovered_mods,

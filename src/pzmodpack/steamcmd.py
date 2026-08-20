@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -29,6 +30,7 @@ STEAMCMD_LINUX_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_
 PROJECT_GITHUB_URL = "https://github.com/saikitsune/ProjectZomboid-Modpack-Builder"
 WORKSHOP_ITEM_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id={}"
 WORKSHOP_DESCRIPTION_MAX_BYTES = 8000
+_SNAPSHOT_STORE_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -276,15 +278,494 @@ def install_steamcmd(
     return executable
 
 
-def _directory_hash(root: Path) -> str:
+def _absolute_path(path: Path) -> Path:
+    return Path(path).expanduser().absolute()
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    details = os.lstat(path)
+    attributes = int(getattr(details, "st_file_attributes", 0))
+    return stat.S_ISLNK(details.st_mode) or bool(
+        attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _assert_plain_directory(path: Path, label: str) -> os.stat_result:
+    try:
+        details = os.lstat(path)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"{label} not found: {path}") from error
+    attributes = int(getattr(details, "st_file_attributes", 0))
+    if stat.S_ISLNK(details.st_mode) or (
+        attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise ValueError(f"{label} cannot be a symbolic link or reparse point: {path}")
+    if not stat.S_ISDIR(details.st_mode):
+        raise ValueError(f"{label} must be a directory: {path}")
+    return details
+
+
+def _assert_plain_tree(root: Path, label: str) -> None:
+    root_details = _assert_plain_directory(root, label)
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in (*directory_names, *file_names):
+            candidate = current_path / name
+            details = os.lstat(candidate)
+            attributes = int(getattr(details, "st_file_attributes", 0))
+            if stat.S_ISLNK(details.st_mode) or (
+                attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise ValueError(
+                    f"{label} contains a symbolic link or reparse point: {candidate}"
+                )
+            if stat.S_ISDIR(details.st_mode) and (
+                details.st_dev != root_details.st_dev or os.path.ismount(candidate)
+            ):
+                raise ValueError(f"{label} contains a nested mount point: {candidate}")
+
+
+def _directory_hash(
+    root: Path,
+    *,
+    exclude_root_snapshot_metadata: bool = False,
+) -> str:
+    root = _absolute_path(root)
+    _assert_plain_tree(root, "Hashed directory")
+    files: list[Path] = []
+    for current, _directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in file_names:
+            path = current_path / name
+            relative = path.relative_to(root)
+            if exclude_root_snapshot_metadata and relative == Path("snapshot.json"):
+                continue
+            files.append(path)
     digest = hashlib.sha256()
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+    # Preserve the original pathlib ordering used by existing snapshot hashes.
+    # WindowsPath compares case-insensitively, which differs from sorting POSIX
+    # strings when a Workshop item contains mixed-case sibling names.
+    for path in sorted(files):
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
         digest.update(b"\0")
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class StoredWorkshopSnapshot:
+    workshop_id: str
+    revision_directory: str
+    sha256: str | None
+    path: Path
+    snapshot_created_at_utc: str | None
+    workshop_updated_at_utc: str | None
+    workshop_manifest_id: str | None
+    mod_folders: tuple[str, ...]
+    metadata_state: str
+    metadata_message: str
+
+    @property
+    def is_valid(self) -> bool:
+        return self.metadata_state in {"valid", "legacy"}
+
+    @property
+    def is_deletable(self) -> bool:
+        return bool(re.fullmatch(r"[0-9a-f]{16,64}", self.revision_directory))
+
+
+@dataclass(frozen=True)
+class WorkshopSnapshotInventory:
+    snapshot_root: Path
+    snapshots: tuple[StoredWorkshopSnapshot, ...]
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WorkshopSnapshotDeletionResult:
+    deleted_paths: tuple[Path, ...]
+    remaining: tuple[StoredWorkshopSnapshot, ...]
+
+
+def _stored_timestamp(value: str | None) -> float:
+    if not value:
+        return float("-inf")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    try:
+        return parsed.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return float("-inf")
+
+
+def _filesystem_timestamp(path: Path) -> str | None:
+    try:
+        return datetime.fromtimestamp(
+            os.lstat(path).st_mtime,
+            UTC,
+        ).isoformat(timespec="seconds")
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _metadata_timestamp(
+    payload: dict[str, object],
+    field: str,
+    errors: list[str],
+) -> str | None:
+    value = payload.get(field)
+    if value is None or str(value).strip() == "":
+        return None
+    cleaned = str(value).strip()
+    if _stored_timestamp(cleaned) == float("-inf"):
+        errors.append(f"{field} is not a valid ISO-8601 timestamp")
+        return None
+    return cleaned
+
+
+def _stored_mod_folders(path: Path) -> tuple[str, ...]:
+    mods = path / "mods"
+    try:
+        if _is_link_or_reparse(mods):
+            return ()
+        details = os.lstat(mods)
+    except OSError:
+        return ()
+    if not stat.S_ISDIR(details.st_mode):
+        return ()
+    result: list[str] = []
+    try:
+        for entry in os.scandir(mods):
+            entry_path = Path(entry.path)
+            if entry.is_dir(follow_symlinks=False) and not _is_link_or_reparse(
+                entry_path
+            ):
+                result.append(entry.name)
+    except OSError:
+        return ()
+    return tuple(sorted(result, key=str.casefold))
+
+
+def _stored_snapshot_record(
+    workshop_id: str,
+    path: Path,
+) -> StoredWorkshopSnapshot:
+    revision_directory = path.name
+    metadata_path = path / "snapshot.json"
+    fallback_created = _filesystem_timestamp(metadata_path) or _filesystem_timestamp(path)
+    errors: list[str] = []
+    sha256: str | None = None
+    snapshot_created_at_utc = fallback_created
+    workshop_updated_at_utc: str | None = None
+    workshop_manifest_id: str | None = None
+    metadata_state = "malformed"
+    plain_snapshot_entry = False
+
+    try:
+        path_details = os.lstat(path)
+        path_attributes = int(getattr(path_details, "st_file_attributes", 0))
+        if stat.S_ISLNK(path_details.st_mode) or (
+            path_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            errors.append("snapshot entry is a symbolic link or reparse point")
+        elif not stat.S_ISDIR(path_details.st_mode):
+            errors.append("snapshot entry is not a directory")
+        else:
+            plain_snapshot_entry = True
+    except OSError as error:
+        errors.append(f"snapshot entry cannot be inspected: {error}")
+
+    payload: dict[str, object] = {}
+    metadata_loaded = False
+    if not errors:
+        try:
+            if _is_link_or_reparse(metadata_path):
+                errors.append("snapshot.json is a symbolic link or reparse point")
+            else:
+                loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload = loaded
+                    metadata_loaded = True
+                else:
+                    errors.append("snapshot.json must contain a JSON object")
+        except FileNotFoundError:
+            errors.append("snapshot.json is missing")
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            errors.append(f"snapshot.json is malformed: {error}")
+
+    format_version = payload.get("format_version")
+    if metadata_loaded:
+        if isinstance(format_version, bool) or format_version not in {1, 2}:
+            errors.append(f"unsupported snapshot metadata format: {format_version!r}")
+        metadata_workshop_id = str(payload.get("workshop_id") or "")
+        if metadata_workshop_id != workshop_id:
+            errors.append(
+                "snapshot Workshop ID does not match its parent directory"
+            )
+        metadata_sha256 = str(payload.get("sha256") or "").strip()
+        if re.fullmatch(r"[0-9a-f]{64}", metadata_sha256):
+            sha256 = metadata_sha256
+        else:
+            errors.append("snapshot SHA-256 must contain 64 lowercase hexadecimal digits")
+        if not re.fullmatch(r"[0-9a-f]{16,64}", revision_directory) or (
+            sha256 is not None and not sha256.startswith(revision_directory)
+        ):
+            errors.append(
+                "snapshot revision directory must be a 16-64 character prefix "
+                "of its SHA-256"
+            )
+        captured = _metadata_timestamp(
+            payload,
+            "snapshot_created_at_utc",
+            errors,
+        )
+        if captured is not None:
+            snapshot_created_at_utc = captured
+        elif format_version == 2:
+            errors.append("format-2 metadata requires snapshot_created_at_utc")
+        workshop_updated_at_utc = _metadata_timestamp(
+            payload,
+            "workshop_updated_at_utc",
+            errors,
+        )
+        raw_manifest_id = payload.get("workshop_manifest_id")
+        if raw_manifest_id is not None and str(raw_manifest_id).strip():
+            cleaned_manifest_id = str(raw_manifest_id).strip()
+            if cleaned_manifest_id.isdigit() and int(cleaned_manifest_id) > 0:
+                workshop_manifest_id = cleaned_manifest_id
+            else:
+                errors.append("workshop_manifest_id must be a positive integer")
+
+    if not errors:
+        if format_version == 1:
+            metadata_state = "legacy"
+            metadata_message = "Legacy snapshot metadata format 1"
+        else:
+            metadata_state = "valid"
+            metadata_message = "Snapshot metadata is valid"
+    else:
+        metadata_message = "; ".join(dict.fromkeys(errors))
+    return StoredWorkshopSnapshot(
+        workshop_id=workshop_id,
+        revision_directory=revision_directory,
+        sha256=sha256,
+        path=path,
+        snapshot_created_at_utc=snapshot_created_at_utc,
+        workshop_updated_at_utc=workshop_updated_at_utc,
+        workshop_manifest_id=workshop_manifest_id,
+        mod_folders=_stored_mod_folders(path) if plain_snapshot_entry else (),
+        metadata_state=metadata_state,
+        metadata_message=metadata_message,
+    )
+
+
+def _stored_snapshot_sort_key(
+    snapshot: StoredWorkshopSnapshot,
+) -> tuple[int, float, float, str]:
+    updated = _stored_timestamp(snapshot.workshop_updated_at_utc)
+    captured = _stored_timestamp(snapshot.snapshot_created_at_utc)
+    effective = updated if updated != float("-inf") else captured
+    return (
+        1 if snapshot.is_valid else 0,
+        effective,
+        captured,
+        snapshot.revision_directory,
+    )
+
+
+def list_stored_workshop_snapshots(snapshot_root: Path) -> WorkshopSnapshotInventory:
+    root = _absolute_path(snapshot_root)
+    if not root.exists():
+        return WorkshopSnapshotInventory(root, ())
+    _assert_plain_directory(root, "Snapshot root")
+    snapshots_by_item: dict[str, list[StoredWorkshopSnapshot]] = {}
+    warnings: list[str] = []
+    with _SNAPSHOT_STORE_LOCK:
+        for item_entry in sorted(os.scandir(root), key=lambda item: item.name):
+            item_path = Path(item_entry.path)
+            if not item_entry.name.isdigit():
+                warnings.append(
+                    f"Ignored unexpected entry in snapshot root: {item_entry.name}"
+                )
+                continue
+            if not item_entry.is_dir(follow_symlinks=False) or _is_link_or_reparse(
+                item_path
+            ):
+                warnings.append(
+                    f"Workshop {item_entry.name} storage is not a plain directory"
+                )
+                continue
+            records: list[StoredWorkshopSnapshot] = []
+            try:
+                revision_entries = sorted(
+                    os.scandir(item_path),
+                    key=lambda item: item.name,
+                )
+            except OSError as error:
+                warnings.append(
+                    f"Could not inspect Workshop {item_entry.name} snapshots: {error}"
+                )
+                continue
+            for revision_entry in revision_entries:
+                record = _stored_snapshot_record(
+                    item_entry.name,
+                    Path(revision_entry.path),
+                )
+                records.append(record)
+                if not record.is_valid:
+                    warnings.append(
+                        f"Workshop {record.workshop_id} snapshot "
+                        f"{record.revision_directory} is malformed: "
+                        f"{record.metadata_message}"
+                    )
+            snapshots_by_item[item_entry.name] = records
+
+    ordered: list[StoredWorkshopSnapshot] = []
+    for workshop_id in sorted(snapshots_by_item, key=lambda value: (int(value), value)):
+        ordered.extend(
+            sorted(
+                snapshots_by_item[workshop_id],
+                key=_stored_snapshot_sort_key,
+                reverse=True,
+            )
+        )
+    return WorkshopSnapshotInventory(root, tuple(ordered), tuple(warnings))
+
+
+def _validate_workshop_storage_id(workshop_id: str) -> None:
+    if not re.fullmatch(r"\d+", workshop_id):
+        raise ValueError(f"Invalid Workshop ID: {workshop_id}")
+
+
+def _validate_revision_directory(revision_directory: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{16,64}", revision_directory):
+        raise ValueError(f"Invalid snapshot revision directory: {revision_directory!r}")
+
+
+def _assert_not_steam_workshop_cache(path: Path) -> None:
+    parts = tuple(
+        part.casefold()
+        for part in _absolute_path(path).resolve(strict=False).parts
+    )
+    cache_signature = ("steamapps", "workshop", "content", PZ_APP_ID)
+    signature_length = len(cache_signature)
+    if any(
+        parts[index : index + signature_length] == cache_signature
+        for index in range(len(parts) - signature_length + 1)
+    ):
+        raise ValueError(
+            "Immutable snapshot storage cannot be inside SteamCMD's mutable "
+            f"Workshop cache: {path}"
+        )
+
+
+def _validated_snapshot_delete_target(
+    root: Path,
+    workshop_id: str,
+    record: StoredWorkshopSnapshot,
+) -> Path:
+    _validate_revision_directory(record.revision_directory)
+    item_root = root / workshop_id
+    _assert_plain_directory(root, "Snapshot root")
+    _assert_plain_directory(item_root, f"Workshop {workshop_id} snapshot directory")
+    _assert_plain_tree(record.path, "Stored snapshot")
+    resolved_root = root.resolve(strict=True)
+    resolved_item = item_root.resolve(strict=True)
+    resolved_target = record.path.resolve(strict=True)
+    if resolved_item.parent != resolved_root or resolved_target.parent != resolved_item:
+        raise ValueError(
+            f"Stored snapshot is outside the configured snapshot root: {record.path}"
+        )
+    return record.path
+
+
+def _remove_snapshot_tree(path: Path) -> None:
+    def handle_read_only(
+        function: Callable[[str], object],
+        candidate: str,
+        _error: tuple[type[BaseException], BaseException, object],
+    ) -> None:
+        os.chmod(candidate, stat.S_IWRITE)
+        function(candidate)
+
+    shutil.rmtree(path, onerror=handle_read_only)
+
+
+def delete_stored_workshop_snapshot(
+    snapshot_root: Path,
+    workshop_id: str,
+    revision_directory: str,
+) -> WorkshopSnapshotDeletionResult:
+    _validate_workshop_storage_id(workshop_id)
+    _validate_revision_directory(revision_directory)
+    root = _absolute_path(snapshot_root)
+    _assert_not_steam_workshop_cache(root)
+    with _SNAPSHOT_STORE_LOCK:
+        inventory = list_stored_workshop_snapshots(root)
+        matches = [
+            item
+            for item in inventory.snapshots
+            if item.workshop_id == workshop_id
+            and item.revision_directory == revision_directory
+        ]
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"Stored Workshop {workshop_id} snapshot "
+                f"{revision_directory!r} was not found"
+            )
+        target = _validated_snapshot_delete_target(root, workshop_id, matches[0])
+        _remove_snapshot_tree(target)
+        item_root = root / workshop_id
+        try:
+            item_root.rmdir()
+        except OSError:
+            pass
+        remaining = tuple(
+            item
+            for item in list_stored_workshop_snapshots(root).snapshots
+            if item.workshop_id == workshop_id
+        )
+        return WorkshopSnapshotDeletionResult((target,), remaining)
+
+
+def delete_all_stored_workshop_snapshots(
+    snapshot_root: Path,
+    workshop_id: str,
+) -> WorkshopSnapshotDeletionResult:
+    _validate_workshop_storage_id(workshop_id)
+    root = _absolute_path(snapshot_root)
+    _assert_not_steam_workshop_cache(root)
+    item_root = root / workshop_id
+    with _SNAPSHOT_STORE_LOCK:
+        _assert_plain_directory(root, "Snapshot root")
+        _assert_plain_directory(
+            item_root,
+            f"Workshop {workshop_id} snapshot directory",
+        )
+        inventory = list_stored_workshop_snapshots(root)
+        records = tuple(
+            item for item in inventory.snapshots if item.workshop_id == workshop_id
+        )
+        direct_entries = tuple(os.scandir(item_root))
+        if len(records) != len(direct_entries):
+            raise ValueError(
+                f"Workshop {workshop_id} snapshot directory contains entries that "
+                "could not be inventoried safely"
+            )
+        targets = tuple(
+            _validated_snapshot_delete_target(root, workshop_id, record)
+            for record in records
+        )
+        for target in targets:
+            _remove_snapshot_tree(target)
+        item_root.rmdir()
+        return WorkshopSnapshotDeletionResult(targets, ())
 
 
 @dataclass(frozen=True)
@@ -410,6 +891,7 @@ class WorkshopSnapshot:
     snapshot_created_at_utc: str | None = None
     workshop_updated_at_utc: str | None = None
     workshop_manifest_id: str | None = None
+    created: bool = False
 
 
 def _snapshot_metadata_created_at(metadata_path: Path) -> str:
@@ -429,6 +911,70 @@ def _write_snapshot_metadata(path: Path, payload: dict[str, object]) -> None:
     temporary.replace(path)
 
 
+def _validated_snapshot_provenance(
+    workshop_updated_at_utc: str | None,
+    workshop_manifest_id: str | None,
+) -> tuple[str | None, str | None]:
+    cleaned_updated_at = (
+        workshop_updated_at_utc.strip()
+        if workshop_updated_at_utc is not None
+        else None
+    )
+    if cleaned_updated_at and _stored_timestamp(cleaned_updated_at) == float("-inf"):
+        raise ValueError("Workshop update time must be a valid ISO-8601 timestamp")
+    cleaned_manifest_id = (
+        workshop_manifest_id.strip()
+        if workshop_manifest_id is not None
+        else None
+    )
+    if cleaned_manifest_id and (
+        not cleaned_manifest_id.isdigit() or int(cleaned_manifest_id) <= 0
+    ):
+        raise ValueError("Workshop manifest ID must be a positive integer")
+    return cleaned_updated_at or None, cleaned_manifest_id or None
+
+
+def _read_existing_snapshot_metadata(
+    record: StoredWorkshopSnapshot,
+    expected_workshop_id: str,
+    expected_sha256: str,
+) -> dict[str, object]:
+    if (
+        not record.is_valid
+        or record.workshop_id != expected_workshop_id
+        or record.sha256 != expected_sha256
+    ):
+        raise ValueError(
+            f"Existing snapshot metadata does not match Workshop item "
+            f"{expected_workshop_id}: {record.path}"
+        )
+    metadata_path = record.path / "snapshot.json"
+    try:
+        loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Existing snapshot metadata is unreadable: {metadata_path}"
+        ) from error
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Existing snapshot metadata is invalid: {metadata_path}")
+    return loaded
+
+
+def _verify_existing_snapshot_payload(
+    record: StoredWorkshopSnapshot,
+    expected_sha256: str,
+) -> None:
+    actual_sha256 = _directory_hash(
+        record.path,
+        exclude_root_snapshot_metadata=True,
+    )
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"Existing snapshot payload hash does not match its immutable identity: "
+            f"{record.path}"
+        )
+
+
 def create_snapshot(
     downloaded_item: Path,
     snapshot_root: Path,
@@ -437,64 +983,165 @@ def create_snapshot(
     workshop_updated_at_utc: str | None = None,
     workshop_manifest_id: str | None = None,
 ) -> WorkshopSnapshot:
-    if not re.fullmatch(r"\d+", workshop_id):
-        raise ValueError(f"Invalid Workshop ID: {workshop_id}")
+    _validate_workshop_storage_id(workshop_id)
+    workshop_updated_at_utc, workshop_manifest_id = _validated_snapshot_provenance(
+        workshop_updated_at_utc,
+        workshop_manifest_id,
+    )
     downloaded_item = Path(downloaded_item).resolve()
     if not downloaded_item.is_dir():
         raise FileNotFoundError(f"Downloaded Workshop item not found: {downloaded_item}")
+    root = _absolute_path(snapshot_root)
+    resolved_root = root.resolve(strict=False)
+    if (
+        resolved_root == downloaded_item
+        or resolved_root.is_relative_to(downloaded_item)
+        or downloaded_item.is_relative_to(resolved_root)
+    ):
+        raise ValueError(
+            "Immutable snapshot storage and the mutable Workshop download cache "
+            f"must be separate: {root} and {downloaded_item}"
+        )
+    _assert_not_steam_workshop_cache(root)
+    reserved_metadata = downloaded_item / "snapshot.json"
+    if reserved_metadata.exists() or reserved_metadata.is_symlink():
+        raise ValueError(
+            f"Downloaded Workshop item contains reserved snapshot.json: {downloaded_item}"
+        )
     sha256 = _directory_hash(downloaded_item)
-    destination = Path(snapshot_root).resolve() / workshop_id / sha256[:16]
-    metadata_path = destination / "snapshot.json"
-    snapshot_created_at_utc = datetime.now(UTC).isoformat(timespec="seconds")
-    if not destination.exists():
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(downloaded_item, destination)
-        existing: dict[str, object] = {}
-    else:
-        try:
-            loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, TypeError, ValueError):
-            loaded = {}
-        existing = loaded if isinstance(loaded, dict) else {}
-        if existing:
-            existing_workshop_id = str(existing.get("workshop_id") or "")
-            existing_sha256 = str(existing.get("sha256") or "")
-            if existing_workshop_id != workshop_id or existing_sha256 != sha256:
-                raise ValueError(
-                    f"Existing snapshot metadata does not match Workshop item {workshop_id}"
-                )
+    with _SNAPSHOT_STORE_LOCK:
+        root.mkdir(parents=True, exist_ok=True)
+        _assert_plain_directory(root, "Snapshot root")
+        item_root = root / workshop_id
+        item_root.mkdir(exist_ok=True)
+        _assert_plain_directory(
+            item_root,
+            f"Workshop {workshop_id} snapshot directory",
+        )
+        inventory = list_stored_workshop_snapshots(root)
+        same_content = [
+            record
+            for record in inventory.snapshots
+            if record.workshop_id == workshop_id
+            and record.sha256 == sha256
+            and record.is_valid
+        ]
+        if len(same_content) > 1:
+            raise ValueError(
+                f"Multiple stored snapshots claim Workshop {workshop_id} hash {sha256}"
+            )
+        if same_content:
+            record = same_content[0]
+            existing = _read_existing_snapshot_metadata(
+                record,
+                workshop_id,
+                sha256,
+            )
+            _verify_existing_snapshot_payload(record, sha256)
+            metadata_path = record.path / "snapshot.json"
             snapshot_created_at_utc = str(
                 existing.get("snapshot_created_at_utc")
                 or _snapshot_metadata_created_at(metadata_path)
             )
+            effective_updated_at = (
+                workshop_updated_at_utc
+                or str(existing.get("workshop_updated_at_utc") or "").strip()
+                or None
+            )
+            effective_manifest_id = (
+                workshop_manifest_id
+                or str(existing.get("workshop_manifest_id") or "").strip()
+                or None
+            )
+            metadata: dict[str, object] = {
+                **existing,
+                "format_version": 2,
+                "workshop_id": workshop_id,
+                "sha256": sha256,
+                "snapshot_created_at_utc": snapshot_created_at_utc,
+            }
+            if effective_updated_at:
+                metadata["workshop_updated_at_utc"] = effective_updated_at
+            if effective_manifest_id:
+                metadata["workshop_manifest_id"] = effective_manifest_id
+            if metadata != existing:
+                _write_snapshot_metadata(metadata_path, metadata)
+            return WorkshopSnapshot(
+                workshop_id,
+                sha256,
+                record.path,
+                snapshot_created_at_utc,
+                effective_updated_at,
+                effective_manifest_id,
+                False,
+            )
 
-    effective_updated_at = str(
-        existing.get("workshop_updated_at_utc") or workshop_updated_at_utc or ""
-    ).strip()
-    effective_manifest_id = str(
-        existing.get("workshop_manifest_id") or workshop_manifest_id or ""
-    ).strip()
-    metadata: dict[str, object] = {
-        **existing,
-        "format_version": 2,
-        "workshop_id": workshop_id,
-        "sha256": sha256,
-        "snapshot_created_at_utc": snapshot_created_at_utc,
-    }
-    if effective_updated_at:
-        metadata["workshop_updated_at_utc"] = effective_updated_at
-    if effective_manifest_id:
-        metadata["workshop_manifest_id"] = effective_manifest_id
-    if metadata != existing:
-        _write_snapshot_metadata(metadata_path, metadata)
-    return WorkshopSnapshot(
-        workshop_id,
-        sha256,
-        destination,
-        snapshot_created_at_utc,
-        effective_updated_at or None,
-        effective_manifest_id or None,
-    )
+        preferred_destination = item_root / sha256[:16]
+        destination = preferred_destination
+        if preferred_destination.exists() or preferred_destination.is_symlink():
+            preferred_records = [
+                record
+                for record in inventory.snapshots
+                if record.workshop_id == workshop_id
+                and record.revision_directory == preferred_destination.name
+            ]
+            if len(preferred_records) != 1 or not preferred_records[0].is_valid:
+                raise ValueError(
+                    f"Existing snapshot metadata is missing or malformed: "
+                    f"{preferred_destination}"
+                )
+            destination = item_root / sha256
+            if destination.exists() or destination.is_symlink():
+                raise ValueError(
+                    f"Full-hash snapshot destination already exists unexpectedly: "
+                    f"{destination}"
+                )
+
+        snapshot_created_at_utc = datetime.now(UTC).isoformat(timespec="seconds")
+        metadata = {
+            "format_version": 2,
+            "workshop_id": workshop_id,
+            "sha256": sha256,
+            "snapshot_created_at_utc": snapshot_created_at_utc,
+        }
+        if workshop_updated_at_utc:
+            metadata["workshop_updated_at_utc"] = workshop_updated_at_utc
+        if workshop_manifest_id:
+            metadata["workshop_manifest_id"] = workshop_manifest_id
+        staging_parent = Path(
+            tempfile.mkdtemp(
+                prefix=f".{sha256[:16]}.",
+                suffix=".tmp",
+                dir=item_root,
+            )
+        )
+        staging = staging_parent / "snapshot"
+        try:
+            shutil.copytree(downloaded_item, staging)
+            copied_sha256 = _directory_hash(staging)
+            if copied_sha256 != sha256:
+                raise ValueError(
+                    f"Workshop {workshop_id} content changed while being copied into "
+                    "an immutable snapshot"
+                )
+            _write_snapshot_metadata(staging / "snapshot.json", metadata)
+            if destination.exists() or destination.is_symlink():
+                raise FileExistsError(
+                    f"Snapshot destination appeared while copying: {destination}"
+                )
+            staging.rename(destination)
+        finally:
+            if staging_parent.exists():
+                shutil.rmtree(staging_parent)
+        return WorkshopSnapshot(
+            workshop_id,
+            sha256,
+            destination,
+            snapshot_created_at_utc,
+            workshop_updated_at_utc,
+            workshop_manifest_id,
+            True,
+        )
 
 
 @dataclass(frozen=True)

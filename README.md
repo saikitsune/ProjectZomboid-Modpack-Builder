@@ -36,6 +36,9 @@ CraftableMilitaryFences -> SaiPack_CraftableMilitaryFences
 - Workshop snapshot revision grouping with one active revision per Workshop item
 - Latest-revision defaults with explicit older-snapshot rollback selection
 - Snapshot capture, Workshop update, and Workshop manifest provenance
+- Dedicated Workshop download manager with grouped snapshot history
+- Per-item update, explicit revision attachment, and confirmed snapshot cleanup
+- Storage-level snapshot integrity checks and path-contained deletion
 - Multiple `mod.info` variants, including root, `42`, and `42.20`
 - Stable Mod ID namespacing
 - Rewriting of `id`, `require`, `loadModAfter`, `loadModBefore`, and `incompatible`
@@ -91,14 +94,15 @@ Valve's Linux SteamCMD bootstrap starts a 32-bit binary. A 64-bit Linux installa
 3. Choose anonymous login or enter a Steam account and optional Guard code.
 4. Paste Workshop URLs or IDs, one per line.
 5. Click **Download, snapshot, and add to pack**.
-6. Open **Build pack** and scan the resulting sources. Historical snapshots are grouped by Workshop item instead of scanned as duplicate mods.
-7. Click **Select snapshots and bundled mods...**. Choose one snapshot revision per Workshop item, then choose the bundled folders from those revisions.
-8. Enter a stable namespace, select the active B41/B42 IDs, choose a preview, set visibility, and choose the version bump for rebuilds.
-9. Choose optional bundled variants. The build opens snapshot selection automatically when an old project contains multiple revisions without a saved choice, and opens bundled selection when folders conflict or have an unsatisfied requirement.
-10. Resolve every highlighted conflict or missing dependency and build the pack.
-11. Review `manifest.json`, `change-notes.txt`, `amp-config.txt`, and hard-coded-ID warnings.
-12. Switch to an authenticated Steam account and test the login.
-13. Open **Workshop upload**, review or edit the generated change note, confirm redistribution permission, and upload.
+6. Optionally open **Manage downloads** to inspect every stored Workshop item and revision, update one item, attach a particular revision, or delete snapshots after confirmation.
+7. Open **Build pack** and scan the resulting sources. Historical snapshots are grouped by Workshop item instead of scanned as duplicate mods.
+8. Click **Select snapshots and bundled mods...**. Choose one snapshot revision per Workshop item, then choose the bundled folders from those revisions.
+9. Enter a stable namespace, select the active B41/B42 IDs, choose a preview, set visibility, and choose the version bump for rebuilds.
+10. Choose optional bundled variants. The build opens snapshot selection automatically when an old project contains multiple revisions without a saved choice, and opens bundled selection when folders conflict or have an unsatisfied requirement.
+11. Resolve every highlighted conflict or missing dependency and build the pack.
+12. Review `manifest.json`, `change-notes.txt`, `amp-config.txt`, and hard-coded-ID warnings.
+13. Switch to an authenticated Steam account and test the login.
+14. Open **Workshop upload**, review or edit the generated change note, confirm redistribution permission, and upload.
 
 Snapshot choices operate on Workshop items: every immutable revision of one Workshop ID appears in a single row and exactly one can be selected. The latest available revision is the default and is clearly labeled; older revisions remain available for rollback. The selector shows the full snapshot source in its tooltip, short content hash, true Workshop update date when Steam recorded one, local capture date, and latest/pinned status. Legacy snapshots created before provenance tracking show an unknown Workshop update date rather than a guessed value.
 
@@ -108,7 +112,7 @@ Workshop ID `0` creates a new item. After a successful creation, SteamCMD update
 
 At upload time, the builder appends a Steam BBCode footer to the user-entered description. It links this project with the uploading program version and lists every included mod folder that has a recorded source Workshop ID. The footer is regenerated from `manifest.json` for each upload, so updating the same Workshop item does not duplicate it. Local sources without a Workshop ID are omitted. Because SteamCMD's Workshop VDF parser treats embedded straight double quotes as delimiters, text values automatically use visually equivalent typographic quotes; paths containing double quotes are rejected instead of silently redirected. Descriptions and change notes are written with real line breaks because Workshop KeyValues does not expand `\n` escape text. Upload preflight measures the normalized UTF-8 text and reports an actionable error instead of silently dropping attribution when the generated description would exceed Steam's 8,000-byte limit.
 
-The program never replaces or deletes a locked snapshot when an upstream item changes. Downloading again creates or reuses a snapshot based on the content hash. Builds follow the latest downloaded revision by default while keeping every older revision selectable. If an older revision was explicitly selected, new downloads preserve that pin until it is changed in the snapshot selector.
+The program never automatically replaces or deletes a locked snapshot when an upstream item changes. Downloading or updating again creates or reuses a snapshot based on the content hash. The **Manage downloads** tab is the only place that permanently deletes stored revisions, and every deletion requires confirmation. It removes builder snapshots only—not SteamCMD's mutable cache—and synchronizes the current in-memory project when an attached revision is removed. Other saved project files are not rewritten automatically. Builds follow the latest downloaded revision by default while keeping every older revision selectable. If an older revision was explicitly selected, new downloads preserve that pin until it is changed in the snapshot selector.
 
 After SteamCMD downloads an item, the builder reads Steam's local `appworkshop_108600.acf` manifest and records the Workshop update time and manifest ID in `snapshot.json` alongside the local UTC capture time. Missing or malformed Steam metadata never blocks a download. Existing format-1 snapshots are upgraded safely when the same content is downloaded again; only their metadata changes, never the frozen mod payload.
 
@@ -121,6 +125,8 @@ Before the new version replaces the latest build, it is completed in a marked st
 Every versioned manifest records the pack version, previous version, builder version, UTC build time, active source Mod IDs, structured detected changes, and the generated Workshop change note. Comparisons use Workshop ID plus source folder identity and SHA-256 source hashes to detect added, removed, and updated bundled mods. Active-version and pack-setting changes are recorded separately. The generated note is written to `change-notes.txt` and loaded into the GUI upload tab for review.
 
 During a batch download, the Workshop tab shows the current item, SteamCMD's item percentage when available, completed-item count, and immutable-snapshot progress. The overall bar reserves its final stage for hashing and snapshotting the downloaded files.
+
+The download manager inventories the snapshot store directly, so an empty or malformed revision remains visible with a warning instead of disappearing from mod discovery. It also shows cache-only Workshop items so they can be updated into immutable snapshots. “Latest stored” means the newest revision already in the local library; it is not a claim that Steam currently has no newer version. Updating a selected item performs that SteamCMD check and shows progress in the manager tab. Snapshot deletion and Workshop updates are disabled while a build or another snapshot mutation is using the same files. The snapshot library and SteamCMD cache must be separate directory trees; both the GUI and storage layer refuse overlapping paths to prevent cache content from ever being mistaken for deletable snapshots.
 
 ## Steam login security
 
