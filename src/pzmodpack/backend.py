@@ -21,6 +21,23 @@ class DiscoveredMod:
     workshop_id: str | None
     display_name: str = ""
     description: str = ""
+    snapshot_sha256: str | None = None
+    snapshot_created_at_utc: str | None = None
+    workshop_updated_at_utc: str | None = None
+    workshop_manifest_id: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkshopSnapshotRevision:
+    workshop_id: str
+    revision_key: str
+    source_root: Path
+    sha256: str | None
+    snapshot_created_at_utc: str | None
+    workshop_updated_at_utc: str | None
+    workshop_manifest_id: str | None
+    mods: tuple[DiscoveredMod, ...]
+    source_order: int = 0
 
 
 @dataclass(frozen=True)
@@ -154,6 +171,7 @@ class BuildConfig:
     active_mod_ids: dict[str, str] = field(default_factory=dict)
     included_mod_ids: tuple[str, ...] | None = None
     version_bump: str = "patch"
+    snapshot_selections: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1122,6 +1140,164 @@ def find_mod_requirements(
     return tuple(requirements)
 
 
+def _snapshot_timestamp(value: str | None) -> float:
+    if not value:
+        return float("-inf")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _snapshot_revision_key(mod: DiscoveredMod) -> str:
+    if mod.snapshot_sha256:
+        return mod.snapshot_sha256
+    return f"path:{mod.source_root.as_posix()}"
+
+
+def _snapshot_revision_sort_key(
+    revision: WorkshopSnapshotRevision,
+) -> tuple[float, float, int, str]:
+    updated = _snapshot_timestamp(revision.workshop_updated_at_utc)
+    captured = _snapshot_timestamp(revision.snapshot_created_at_utc)
+    effective_revision_time = updated if updated != float("-inf") else captured
+    return (
+        effective_revision_time,
+        captured,
+        revision.source_order,
+        revision.revision_key,
+    )
+
+
+def workshop_snapshot_groups(
+    mods: Iterable[DiscoveredMod],
+) -> dict[str, tuple[WorkshopSnapshotRevision, ...]]:
+    """Group all discovered mod folders into ordered revisions per Workshop item."""
+    grouped: dict[tuple[str, Path], list[DiscoveredMod]] = {}
+    source_order: dict[tuple[str, Path], int] = {}
+    for index, mod in enumerate(mods):
+        if mod.workshop_id is None:
+            continue
+        key = (mod.workshop_id, mod.source_root)
+        grouped.setdefault(key, []).append(mod)
+        source_order.setdefault(key, index)
+
+    revisions: dict[str, list[WorkshopSnapshotRevision]] = {}
+    for (workshop_id, source_root), revision_mods in grouped.items():
+        representative = revision_mods[0]
+        revisions.setdefault(workshop_id, []).append(
+            WorkshopSnapshotRevision(
+                workshop_id=workshop_id,
+                revision_key=_snapshot_revision_key(representative),
+                source_root=source_root,
+                sha256=representative.snapshot_sha256,
+                snapshot_created_at_utc=representative.snapshot_created_at_utc,
+                workshop_updated_at_utc=representative.workshop_updated_at_utc,
+                workshop_manifest_id=representative.workshop_manifest_id,
+                mods=tuple(revision_mods),
+                source_order=source_order[(workshop_id, source_root)],
+            )
+        )
+
+    return {
+        workshop_id: tuple(
+            sorted(
+                item_revisions,
+                key=_snapshot_revision_sort_key,
+                reverse=True,
+            )
+        )
+        for workshop_id, item_revisions in sorted(revisions.items())
+    }
+
+
+def resolve_workshop_snapshots(
+    mods: Iterable[DiscoveredMod],
+    selections: dict[str, str] | None = None,
+) -> tuple[list[DiscoveredMod], dict[str, str]]:
+    """Choose exactly one revision per Workshop item, defaulting to the latest."""
+    mod_list = list(mods)
+    requested = selections or {}
+    groups = workshop_snapshot_groups(mod_list)
+    unknown_workshop_ids = sorted(set(requested) - set(groups))
+    if unknown_workshop_ids:
+        raise BuildError(
+            "Snapshot selection references Workshop item(s) not present in the "
+            f"configured sources: {', '.join(unknown_workshop_ids)}"
+        )
+    chosen_sources: dict[str, Path] = {}
+    effective: dict[str, str] = {}
+    for workshop_id, revisions in groups.items():
+        selected_key = requested.get(workshop_id)
+        if selected_key is None:
+            selected = revisions[0]
+        else:
+            selected = next(
+                (
+                    revision
+                    for revision in revisions
+                    if revision.revision_key == selected_key
+                    or revision.sha256 == selected_key
+                ),
+                None,
+            )
+            if selected is None:
+                raise BuildError(
+                    f"Selected snapshot {selected_key!r} for Workshop item "
+                    f"{workshop_id} is not in the configured sources"
+                )
+        chosen_sources[workshop_id] = selected.source_root
+        effective[workshop_id] = selected.revision_key
+
+    selected_mods = [
+        mod
+        for mod in mod_list
+        if mod.workshop_id is None
+        or mod.source_root == chosen_sources.get(mod.workshop_id)
+    ]
+    return selected_mods, effective
+
+
+def workshop_snapshot_manifest(
+    mods: Iterable[DiscoveredMod],
+    selections: dict[str, str],
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for workshop_id, revisions in workshop_snapshot_groups(mods).items():
+        selected_key = selections[workshop_id]
+        selected = next(
+            revision for revision in revisions if revision.revision_key == selected_key
+        )
+        records.append(
+            {
+                "workshop_id": workshop_id,
+                "selected_revision": selected.revision_key,
+                "selected_source": str(selected.source_root),
+                "selected_sha256": selected.sha256,
+                "snapshot_created_at_utc": selected.snapshot_created_at_utc,
+                "workshop_updated_at_utc": selected.workshop_updated_at_utc,
+                "workshop_manifest_id": selected.workshop_manifest_id,
+                "selected_is_latest": selected is revisions[0],
+                "available_revisions": [
+                    {
+                        "revision": revision.revision_key,
+                        "source": str(revision.source_root),
+                        "sha256": revision.sha256,
+                        "snapshot_created_at_utc": revision.snapshot_created_at_utc,
+                        "workshop_updated_at_utc": revision.workshop_updated_at_utc,
+                        "workshop_manifest_id": revision.workshop_manifest_id,
+                        "is_latest": revision is revisions[0],
+                    }
+                    for revision in revisions
+                ],
+            }
+        )
+    return records
+
+
 def select_mods(
     mods: Iterable[DiscoveredMod],
     included_mod_ids: tuple[str, ...] | None,
@@ -1198,9 +1374,25 @@ def _build_modpack(
     if config.visibility not in {0, 1, 2, 3}:
         raise BuildError("Workshop visibility must be 0, 1, 2, or 3")
     _emit_progress(progress, 5, "Discovering mod sources")
-    discovered_mods = discover_mods(config.sources)
-    if not discovered_mods:
+    all_discovered_mods = discover_mods(config.sources)
+    if not all_discovered_mods:
         raise BuildError("No mods were discovered in the selected sources")
+    discovered_mods, effective_snapshot_selections = resolve_workshop_snapshots(
+        all_discovered_mods,
+        config.snapshot_selections,
+    )
+    if config.included_mod_ids is not None:
+        available_mod_ids = {
+            mod_id for mod in discovered_mods for mod_id in mod.mod_ids
+        }
+        missing_selected_ids = sorted(
+            set(config.included_mod_ids) - available_mod_ids
+        )
+        if missing_selected_ids:
+            raise BuildError(
+                "Selected snapshot revisions no longer provide bundled Mod ID(s): "
+                f"{', '.join(missing_selected_ids)}. Reopen bundled mod selection."
+            )
     mods = select_mods(discovered_mods, config.included_mod_ids)
     if not mods:
         raise BuildError("No bundled mod folders are selected for this build")
@@ -1304,6 +1496,10 @@ def _build_modpack(
                 "display_name": mod.display_name or mod.folder_name,
                 "packed_folder": destination.name,
                 "source_workshop_id": mod.workshop_id,
+                "source_snapshot_sha256": mod.snapshot_sha256,
+                "snapshot_created_at_utc": mod.snapshot_created_at_utc,
+                "workshop_updated_at_utc": mod.workshop_updated_at_utc,
+                "workshop_manifest_id": mod.workshop_manifest_id,
                 "original_mod_ids": list(mod.mod_ids),
                 "packed_mod_ids": [mapping[item] for item in mod.mod_ids],
                 "active_source_mod_id": config.active_mod_ids.get(
@@ -1361,6 +1557,10 @@ def _build_modpack(
         "visibility": config.visibility,
         "preview": str(Path(config.preview).resolve()) if config.preview else None,
         "mapping": mapping,
+        "snapshot_selection": workshop_snapshot_manifest(
+            all_discovered_mods,
+            effective_snapshot_selections,
+        ),
         "mod_selection": {
             "included_mod_ids": sorted(mapping),
             "excluded_mods": [
@@ -1474,16 +1674,40 @@ def _read_mod_info_value(
     return None
 
 
-def _workshop_id(path: Path) -> str | None:
+def _snapshot_metadata(path: Path) -> dict[str, object]:
     for candidate in (path, *path.parents):
         metadata = candidate / "snapshot.json"
         if metadata.is_file():
             try:
-                workshop_id = str(json.loads(metadata.read_text(encoding="utf-8"))["workshop_id"])
-            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-                workshop_id = ""
-            if workshop_id.isdigit():
-                return workshop_id
+                payload = json.loads(metadata.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if not payload.get("snapshot_created_at_utc") and not payload.get(
+                "created_at_utc"
+            ):
+                try:
+                    payload["snapshot_created_at_utc"] = datetime.fromtimestamp(
+                        metadata.stat().st_mtime,
+                        UTC,
+                    ).isoformat(timespec="seconds")
+                except OSError:
+                    pass
+            return payload
+    return {}
+
+
+def _workshop_id(path: Path, snapshot_metadata: dict[str, object]) -> str | None:
+    workshop_id = str(snapshot_metadata.get("workshop_id") or "")
+    if workshop_id.isdigit():
+        return workshop_id
+    for candidate in (path, *path.parents):
+        if (
+            (candidate / "snapshot.json").is_file()
+            and candidate.parent.name.isdigit()
+        ):
+            return candidate.parent.name
         if candidate.name.isdigit() and candidate.parent.name == "108600":
             return candidate.name
     return None
@@ -1548,7 +1772,13 @@ def rewrite_mod_info(
 
 def discover_mods(source_roots: Iterable[Path]) -> list[DiscoveredMod]:
     discovered: list[DiscoveredMod] = []
+    seen_sources: set[Path] = set()
     for source in (Path(item).resolve() for item in source_roots):
+        if source in seen_sources:
+            continue
+        seen_sources.add(source)
+        snapshot_metadata = _snapshot_metadata(source)
+        workshop_id = _workshop_id(source, snapshot_metadata)
         mods_root = source / "mods" if (source / "mods").is_dir() else source
         candidates = [path for path in sorted(mods_root.iterdir()) if path.is_dir()]
         if (mods_root / "mod.info").is_file():
@@ -1576,13 +1806,37 @@ def discover_mods(source_roots: Iterable[Path]) -> list[DiscoveredMod]:
                         mod_directory=mod_directory,
                         folder_name=mod_directory.name,
                         mod_ids=ids,
-                        workshop_id=_workshop_id(source),
+                        workshop_id=workshop_id,
                         display_name=(
                             _read_mod_info_value(display_info, "name")
                             or mod_directory.name
                         ),
                         description=(
                             _read_mod_info_value(display_info, "description") or ""
+                        ),
+                        snapshot_sha256=(
+                            str(snapshot_metadata.get("sha256"))
+                            if snapshot_metadata.get("sha256")
+                            else None
+                        ),
+                        snapshot_created_at_utc=(
+                            str(
+                                snapshot_metadata.get("snapshot_created_at_utc")
+                                or snapshot_metadata.get("created_at_utc")
+                            )
+                            if snapshot_metadata.get("snapshot_created_at_utc")
+                            or snapshot_metadata.get("created_at_utc")
+                            else None
+                        ),
+                        workshop_updated_at_utc=(
+                            str(snapshot_metadata.get("workshop_updated_at_utc"))
+                            if snapshot_metadata.get("workshop_updated_at_utc")
+                            else None
+                        ),
+                        workshop_manifest_id=(
+                            str(snapshot_metadata.get("workshop_manifest_id"))
+                            if snapshot_metadata.get("workshop_manifest_id")
+                            else None
                         ),
                     )
                 )

@@ -33,6 +33,9 @@ CraftableMilitaryFences -> SaiPack_CraftableMilitaryFences
 - Cached account login support for uploads without reentering a password
 - Safe upload VDF generation and automatic capture of newly published Workshop IDs
 - Content-addressed immutable snapshots
+- Workshop snapshot revision grouping with one active revision per Workshop item
+- Latest-revision defaults with explicit older-snapshot rollback selection
+- Snapshot capture, Workshop update, and Workshop manifest provenance
 - Multiple `mod.info` variants, including root, `42`, and `42.20`
 - Stable Mod ID namespacing
 - Rewriting of `id`, `require`, `loadModAfter`, `loadModBefore`, and `incompatible`
@@ -88,22 +91,26 @@ Valve's Linux SteamCMD bootstrap starts a 32-bit binary. A 64-bit Linux installa
 3. Choose anonymous login or enter a Steam account and optional Guard code.
 4. Paste Workshop URLs or IDs, one per line.
 5. Click **Download, snapshot, and add to pack**.
-6. Open **Build pack** and scan the resulting sources.
-7. Review errors and warnings.
+6. Open **Build pack** and scan the resulting sources. Historical snapshots are grouped by Workshop item instead of scanned as duplicate mods.
+7. Click **Select snapshots and bundled mods...**. Choose one snapshot revision per Workshop item, then choose the bundled folders from those revisions.
 8. Enter a stable namespace, select the active B41/B42 IDs, choose a preview, set visibility, and choose the version bump for rebuilds.
-9. Click **Select bundled mods...** to include or exclude optional variants. The build also opens this dialog automatically when selected folders conflict or have an unsatisfied requirement.
+9. Choose optional bundled variants. The build opens snapshot selection automatically when an old project contains multiple revisions without a saved choice, and opens bundled selection when folders conflict or have an unsatisfied requirement.
 10. Resolve every highlighted conflict or missing dependency and build the pack.
 11. Review `manifest.json`, `change-notes.txt`, `amp-config.txt`, and hard-coded-ID warnings.
 12. Switch to an authenticated Steam account and test the login.
 13. Open **Workshop upload**, review or edit the generated change note, confirm redistribution permission, and upload.
 
-Bundled choices operate on mod folders. Patch-level directories such as `42.19` and `42.20` inside `WaterPipes` remain together, while a separate folder such as `WaterPipesRemoved` can be excluded. The dialog shows the name, active Mod ID, all declared IDs, requirements, Workshop source, description, and incompatibilities for each folder. Selecting a mod recursively checks required providers already present in the downloaded source list, and a provider cannot be unchecked while a selected mod depends on it. A missing provider is labeled `[MISSING]` with the exact required Mod ID so its Workshop item or source can be added. Confirmation and builds remain blocked until requirements and conflicts are resolved.
+Snapshot choices operate on Workshop items: every immutable revision of one Workshop ID appears in a single row and exactly one can be selected. The latest available revision is the default and is clearly labeled; older revisions remain available for rollback. The selector shows the full snapshot source in its tooltip, short content hash, true Workshop update date when Steam recorded one, local capture date, and latest/pinned status. Legacy snapshots created before provenance tracking show an unknown Workshop update date rather than a guessed value.
+
+Bundled choices then operate on mod folders from only the chosen snapshots. Patch-level directories such as `42.19` and `42.20` inside `WaterPipes` remain together, while a separate folder such as `WaterPipesRemoved` can be excluded. The dialog shows the name, active Mod ID, all declared IDs, requirements, Workshop source, snapshot provenance, description, and incompatibilities for each folder. Selecting a mod recursively checks required providers already present in the selected revisions, and a provider cannot be unchecked while a selected mod depends on it. A missing provider is labeled `[MISSING]` with the exact required Mod ID so its Workshop item or source can be added. Confirmation and builds remain blocked until requirements and conflicts are resolved.
 
 Workshop ID `0` creates a new item. After a successful creation, SteamCMD updates the VDF and the builder writes the new ID into `manifest.json`, `workshop.txt`, `amp-config.txt`, and the GUI field. An existing Workshop ID updates that item instead.
 
 At upload time, the builder appends a Steam BBCode footer to the user-entered description. It links this project with the uploading program version and lists every included mod folder that has a recorded source Workshop ID. The footer is regenerated from `manifest.json` for each upload, so updating the same Workshop item does not duplicate it. Local sources without a Workshop ID are omitted. Upload preflight reports an actionable error instead of silently dropping attribution when the generated description would exceed Steam's 8,000-byte limit.
 
-The program never automatically replaces a locked snapshot when an upstream item changes. Downloading again creates or reuses a snapshot based on the content hash.
+The program never replaces or deletes a locked snapshot when an upstream item changes. Downloading again creates or reuses a snapshot based on the content hash. Builds follow the latest downloaded revision by default while keeping every older revision selectable. If an older revision was explicitly selected, new downloads preserve that pin until it is changed in the snapshot selector.
+
+After SteamCMD downloads an item, the builder reads Steam's local `appworkshop_108600.acf` manifest and records the Workshop update time and manifest ID in `snapshot.json` alongside the local UTC capture time. Missing or malformed Steam metadata never blocks a download. Existing format-1 snapshots are upgraded safely when the same content is downloaded again; only their metadata changes, never the frozen mod payload.
 
 ### Modpack version history
 
@@ -143,6 +150,8 @@ Inspect sources:
 ```bash
 uv run pzmodpack scan /path/to/item /path/to/another-item --json
 ```
+
+When multiple revisions of one Workshop item are supplied, scan and build use the latest by default. Pin an older revision for a reproducible CLI operation with `--snapshot-revision WORKSHOP_ID=FULL_SHA256`.
 
 Install SteamCMD:
 
@@ -266,7 +275,7 @@ Known layout and script fixes are equally strict: they run only for an exact sou
 
 ## Project files
 
-GUI projects use the suffix `.pzpack.json` and store paths, Workshop IDs, pack metadata, source and bundled-mod selections, preview/visibility, version-bump preference, and active Mod ID overrides. They do not store Steam usernames, passwords, or Steam Guard codes. `manifest.json` records both included Mod IDs and excluded source folders so every build's choice and release diff can be audited.
+GUI projects use the suffix `.pzpack.json` and store paths, Workshop IDs, pack metadata, source and bundled-mod selections, selected snapshot revisions, preview/visibility, version-bump preference, and active Mod ID overrides. Existing project files without snapshot choices continue loading and default each Workshop item to its latest available revision. They do not store Steam usernames, passwords, or Steam Guard codes. `manifest.json` records the selected and available snapshot revisions with their hashes and dates, plus included Mod IDs and excluded source folders, so every build's source choice and release diff can be audited.
 
 ## Redistribution and permissions
 

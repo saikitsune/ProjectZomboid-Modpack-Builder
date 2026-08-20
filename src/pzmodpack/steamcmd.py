@@ -16,6 +16,7 @@ import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
@@ -250,16 +251,154 @@ def _directory_hash(root: Path) -> str:
 
 
 @dataclass(frozen=True)
+class _WorkshopItemMetadata:
+    updated_at_utc: str | None = None
+    manifest_id: str | None = None
+
+
+_KEYVALUES_TOKEN = re.compile(r'"((?:\\.|[^"\\])*)"|([{}])')
+
+
+def _parse_keyvalues(text: str) -> dict[str, object]:
+    """Parse the small Valve KeyValues subset used by appworkshop ACF files."""
+    tokens: list[str] = []
+    cursor = 0
+    for match in _KEYVALUES_TOKEN.finditer(text):
+        if text[cursor : match.start()].strip():
+            raise ValueError("Malformed Valve KeyValues data")
+        quoted, brace = match.groups()
+        token = brace if brace is not None else quoted
+        if token is None:
+            raise ValueError("Malformed Valve KeyValues data")
+        tokens.append(token)
+        cursor = match.end()
+    if text[cursor:].strip() or not tokens:
+        raise ValueError("Malformed Valve KeyValues data")
+
+    def parse_object(index: int, nested: bool) -> tuple[dict[str, object], int]:
+        result: dict[str, object] = {}
+        while index < len(tokens):
+            key = tokens[index]
+            if key == "}":
+                if not nested:
+                    raise ValueError("Unexpected closing brace in Valve KeyValues data")
+                return result, index + 1
+            if key == "{":
+                raise ValueError("Unexpected opening brace in Valve KeyValues data")
+            index += 1
+            if index >= len(tokens) or tokens[index] == "}":
+                raise ValueError("Missing value in Valve KeyValues data")
+            value: object = tokens[index]
+            index += 1
+            if value == "{":
+                value, index = parse_object(index, True)
+            result[key] = value
+        if nested:
+            raise ValueError("Unclosed object in Valve KeyValues data")
+        return result, index
+
+    parsed, final_index = parse_object(0, False)
+    if final_index != len(tokens):
+        raise ValueError("Trailing Valve KeyValues data")
+    return parsed
+
+
+def _casefolded_value(mapping: object, key: str) -> object | None:
+    if not isinstance(mapping, dict):
+        return None
+    wanted = key.casefold()
+    return next(
+        (value for candidate, value in mapping.items() if str(candidate).casefold() == wanted),
+        None,
+    )
+
+
+def _positive_numeric_value(mapping: object, key: str) -> str | None:
+    value = _casefolded_value(mapping, key)
+    cleaned = str(value).strip() if value is not None else ""
+    return cleaned if cleaned.isdigit() and int(cleaned) > 0 else None
+
+
+def _unix_timestamp_utc(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), UTC).isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _read_workshop_item_metadata(
+    library_root: Path,
+    workshop_ids: tuple[str, ...],
+) -> dict[str, _WorkshopItemMetadata]:
+    """Read current Workshop revision metadata without making downloads depend on it."""
+    metadata_path = (
+        Path(library_root)
+        / "steamapps"
+        / "workshop"
+        / f"appworkshop_{PZ_APP_ID}.acf"
+    )
+    try:
+        payload = _parse_keyvalues(metadata_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    app_workshop = _casefolded_value(payload, "AppWorkshop")
+    installed_items = _casefolded_value(app_workshop, "WorkshopItemsInstalled")
+    item_details = _casefolded_value(app_workshop, "WorkshopItemDetails")
+    result: dict[str, _WorkshopItemMetadata] = {}
+    for workshop_id in workshop_ids:
+        installed = _casefolded_value(installed_items, workshop_id)
+        details = _casefolded_value(item_details, workshop_id)
+        updated_timestamp = _positive_numeric_value(details, "latest_timeupdated")
+        if updated_timestamp is None:
+            updated_timestamp = _positive_numeric_value(installed, "timeupdated")
+        manifest_id = _positive_numeric_value(details, "latest_manifest")
+        if manifest_id is None:
+            manifest_id = _positive_numeric_value(installed, "manifest")
+        updated_at_utc = _unix_timestamp_utc(updated_timestamp)
+        if updated_at_utc is not None or manifest_id is not None:
+            result[workshop_id] = _WorkshopItemMetadata(
+                updated_at_utc=updated_at_utc,
+                manifest_id=manifest_id,
+            )
+    return result
+
+
+@dataclass(frozen=True)
 class WorkshopSnapshot:
     workshop_id: str
     sha256: str
     path: Path
+    snapshot_created_at_utc: str | None = None
+    workshop_updated_at_utc: str | None = None
+    workshop_manifest_id: str | None = None
+
+
+def _snapshot_metadata_created_at(metadata_path: Path) -> str:
+    try:
+        timestamp = metadata_path.stat().st_mtime
+    except OSError:
+        return datetime.now(UTC).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="seconds")
+
+
+def _write_snapshot_metadata(path: Path, payload: dict[str, object]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def create_snapshot(
     downloaded_item: Path,
     snapshot_root: Path,
     workshop_id: str,
+    *,
+    workshop_updated_at_utc: str | None = None,
+    workshop_manifest_id: str | None = None,
 ) -> WorkshopSnapshot:
     if not re.fullmatch(r"\d+", workshop_id):
         raise ValueError(f"Invalid Workshop ID: {workshop_id}")
@@ -268,23 +407,57 @@ def create_snapshot(
         raise FileNotFoundError(f"Downloaded Workshop item not found: {downloaded_item}")
     sha256 = _directory_hash(downloaded_item)
     destination = Path(snapshot_root).resolve() / workshop_id / sha256[:16]
+    metadata_path = destination / "snapshot.json"
+    snapshot_created_at_utc = datetime.now(UTC).isoformat(timespec="seconds")
     if not destination.exists():
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(downloaded_item, destination)
-        (destination / "snapshot.json").write_text(
-            json.dumps(
-                {
-                    "format_version": 1,
-                    "workshop_id": workshop_id,
-                    "sha256": sha256,
-                },
-                indent=2,
-                sort_keys=True,
+        existing: dict[str, object] = {}
+    else:
+        try:
+            loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            loaded = {}
+        existing = loaded if isinstance(loaded, dict) else {}
+        if existing:
+            existing_workshop_id = str(existing.get("workshop_id") or "")
+            existing_sha256 = str(existing.get("sha256") or "")
+            if existing_workshop_id != workshop_id or existing_sha256 != sha256:
+                raise ValueError(
+                    f"Existing snapshot metadata does not match Workshop item {workshop_id}"
+                )
+            snapshot_created_at_utc = str(
+                existing.get("snapshot_created_at_utc")
+                or _snapshot_metadata_created_at(metadata_path)
             )
-            + "\n",
-            encoding="utf-8",
-        )
-    return WorkshopSnapshot(workshop_id, sha256, destination)
+
+    effective_updated_at = str(
+        existing.get("workshop_updated_at_utc") or workshop_updated_at_utc or ""
+    ).strip()
+    effective_manifest_id = str(
+        existing.get("workshop_manifest_id") or workshop_manifest_id or ""
+    ).strip()
+    metadata: dict[str, object] = {
+        **existing,
+        "format_version": 2,
+        "workshop_id": workshop_id,
+        "sha256": sha256,
+        "snapshot_created_at_utc": snapshot_created_at_utc,
+    }
+    if effective_updated_at:
+        metadata["workshop_updated_at_utc"] = effective_updated_at
+    if effective_manifest_id:
+        metadata["workshop_manifest_id"] = effective_manifest_id
+    if metadata != existing:
+        _write_snapshot_metadata(metadata_path, metadata)
+    return WorkshopSnapshot(
+        workshop_id,
+        sha256,
+        destination,
+        snapshot_created_at_utc,
+        effective_updated_at or None,
+        effective_manifest_id or None,
+    )
 
 
 @dataclass(frozen=True)
@@ -658,6 +831,7 @@ def download_and_snapshot(
         return DownloadBatchResult(command_result, ())
     if tracker is not None:
         tracker.finish()
+    workshop_metadata = _read_workshop_item_metadata(client.library_root, workshop_ids)
     snapshots: list[WorkshopSnapshot] = []
     for index, workshop_id in enumerate(workshop_ids, start=1):
         if progress is not None:
@@ -667,11 +841,14 @@ def download_and_snapshot(
                 f"Snapshotting Workshop item {index}/{len(workshop_ids)} "
                 f"({workshop_id})...",
             )
+        item_metadata = workshop_metadata.get(workshop_id, _WorkshopItemMetadata())
         snapshots.append(
             create_snapshot(
                 client.downloaded_item_path(workshop_id),
                 snapshot_root,
                 workshop_id,
+                workshop_updated_at_utc=item_metadata.updated_at_utc,
+                workshop_manifest_id=item_metadata.manifest_id,
             )
         )
         if progress is not None:

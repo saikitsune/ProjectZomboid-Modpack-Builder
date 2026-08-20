@@ -16,6 +16,57 @@ from pzmodpack.steamcmd import (
 
 
 class CliTests(unittest.TestCase):
+    def test_scan_groups_workshop_revisions_and_allows_an_explicit_pin(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshots = []
+            for name, sha256, updated, mod_id in (
+                ("old", "a" * 64, "2026-08-18T12:00:00+00:00", "OldId"),
+                ("new", "b" * 64, "2026-08-19T12:00:00+00:00", "NewId"),
+            ):
+                snapshot = root / "snapshots" / "111" / name
+                mod = snapshot / "mods" / "Example" / "42"
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    f"id={mod_id}\n",
+                    encoding="utf-8",
+                )
+                (snapshot / "snapshot.json").write_text(
+                    json.dumps(
+                        {
+                            "format_version": 2,
+                            "workshop_id": "111",
+                            "sha256": sha256,
+                            "snapshot_created_at_utc": updated,
+                            "workshop_updated_at_utc": updated,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                snapshots.append(snapshot)
+
+            latest_output = StringIO()
+            with redirect_stdout(latest_output):
+                latest_exit = main(
+                    ["scan", *(str(path) for path in snapshots), "--json"]
+                )
+            pinned_output = StringIO()
+            with redirect_stdout(pinned_output):
+                pinned_exit = main(
+                    [
+                        "scan",
+                        *(str(path) for path in snapshots),
+                        "--json",
+                        "--snapshot-revision",
+                        f"111={'a' * 64}",
+                    ]
+                )
+
+            self.assertEqual(latest_exit, 0)
+            self.assertEqual(pinned_exit, 0)
+            self.assertEqual(json.loads(latest_output.getvalue())[0]["mod_ids"], ["NewId"])
+            self.assertEqual(json.loads(pinned_output.getvalue())[0]["mod_ids"], ["OldId"])
+
     def test_scan_outputs_machine_readable_mod_inventory(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

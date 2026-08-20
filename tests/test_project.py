@@ -24,6 +24,7 @@ class ProjectSettingsTests(unittest.TestCase):
                 workshop_items=("111", "222"),
                 included_mod_ids=("Waterpipes", "Neat_Building"),
                 version_bump="minor",
+                snapshot_selections={"111": "a" * 64},
             )
 
             save_project(project_file, settings)
@@ -65,6 +66,7 @@ class ProjectSettingsTests(unittest.TestCase):
 
             self.assertIsNone(restored.included_mod_ids)
             self.assertEqual(restored.version_bump, "patch")
+            self.assertEqual(restored.snapshot_selections, {})
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ class ProjectSettings:
     active_mod_ids: dict[str, str] = field(default_factory=dict)
     included_mod_ids: tuple[str, ...] | None = None
     version_bump: str = "patch"
+    snapshot_selections: dict[str, str] = field(default_factory=dict)
 
 
 def save_project(path: Path, settings: ProjectSettings) -> None:
@@ -77,4 +78,11 @@ def load_project(path: Path) -> ProjectSettings:
             else None
         ),
         version_bump=str(payload.get("version_bump", "patch")),
+        snapshot_selections={
+            str(workshop_id): str(revision)
+            for workshop_id, revision in payload.get(
+                "snapshot_selections",
+                {},
+            ).items()
+        },
     )

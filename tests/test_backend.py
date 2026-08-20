@@ -11,13 +11,99 @@ from pzmodpack.backend import (
     discover_mods,
     find_bundled_conflicts,
     find_mod_requirements,
+    resolve_workshop_snapshots,
     rewrite_mod_info,
     validate_mods,
     validate_mod_selection,
+    workshop_snapshot_groups,
 )
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_groups_workshop_snapshots_and_defaults_to_latest_revision(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            old = root / "snapshots" / "111" / "old"
+            latest = root / "snapshots" / "111" / "latest"
+            for snapshot, sha256, updated, mod_id in (
+                (old, "a" * 64, "2026-08-18T12:00:00+00:00", "ExampleOld"),
+                (latest, "b" * 64, "2026-08-19T12:00:00+00:00", "ExampleLatest"),
+            ):
+                mod = snapshot / "mods" / "Example" / "42"
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    f"name=Example\nid={mod_id}\n",
+                    encoding="utf-8",
+                )
+                (snapshot / "snapshot.json").write_text(
+                    json.dumps(
+                        {
+                            "format_version": 2,
+                            "workshop_id": "111",
+                            "sha256": sha256,
+                            "snapshot_created_at_utc": updated,
+                            "workshop_updated_at_utc": updated,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            discovered = discover_mods((old, latest))
+            groups = workshop_snapshot_groups(discovered)
+            selected, effective = resolve_workshop_snapshots(discovered)
+            pinned, pinned_effective = resolve_workshop_snapshots(
+                discovered,
+                {"111": "a" * 64},
+            )
+
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(len(groups["111"]), 2)
+            self.assertEqual(groups["111"][0].sha256, "b" * 64)
+            self.assertEqual([mod.mod_ids for mod in selected], [("ExampleLatest",)])
+            self.assertEqual(effective, {"111": "b" * 64})
+            self.assertEqual([mod.mod_ids for mod in pinned], [("ExampleOld",)])
+            self.assertEqual(pinned_effective, {"111": "a" * 64})
+
+            with self.assertRaisesRegex(BuildError, "not in the configured sources"):
+                resolve_workshop_snapshots(discovered, {"111": "missing"})
+            with self.assertRaisesRegex(BuildError, "not present.*999"):
+                resolve_workshop_snapshots(discovered, {"999": "a" * 64})
+
+    def test_snapshot_grouping_does_not_hide_duplicates_from_different_items(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshots = []
+            for workshop_id, sha256 in (("111", "a" * 64), ("222", "b" * 64)):
+                snapshot = root / "snapshots" / workshop_id / sha256[:16]
+                mod = snapshot / "mods" / f"Example{workshop_id}" / "42"
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    "id=DuplicateId\n",
+                    encoding="utf-8",
+                )
+                (snapshot / "snapshot.json").write_text(
+                    json.dumps(
+                        {
+                            "format_version": 2,
+                            "workshop_id": workshop_id,
+                            "sha256": sha256,
+                            "snapshot_created_at_utc": "2026-08-19T12:00:00+00:00",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                snapshots.append(snapshot)
+
+            selected, _effective = resolve_workshop_snapshots(
+                discover_mods(snapshots)
+            )
+            issues = validate_mods(selected)
+
+            self.assertEqual(len(selected), 2)
+            self.assertTrue(
+                any(issue.code == "duplicate_mod_id" for issue in issues)
+            )
+
     def test_discovers_a_workshop_item_and_all_versioned_mod_ids(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -51,6 +137,22 @@ class DiscoveryTests(unittest.TestCase):
             discovered = discover_mods([snapshot])
 
             self.assertEqual(discovered[0].workshop_id, "2921417999")
+
+    def test_malformed_legacy_snapshot_metadata_still_forms_a_revision_group(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            snapshot = Path(temporary_directory) / "snapshots" / "2921417999" / "bad"
+            mod = snapshot / "mods" / "Scalies"
+            mod.mkdir(parents=True)
+            (mod / "mod.info").write_text("id=Scalies\n", encoding="utf-8")
+            (snapshot / "snapshot.json").write_text("{broken", encoding="utf-8")
+
+            discovered = discover_mods([snapshot])
+            groups = workshop_snapshot_groups(discovered)
+
+            self.assertEqual(discovered[0].workshop_id, "2921417999")
+            self.assertIsNotNone(discovered[0].snapshot_created_at_utc)
+            self.assertEqual(list(groups), ["2921417999"])
+            self.assertEqual(len(groups["2921417999"]), 1)
 
 
 class RewriteTests(unittest.TestCase):
@@ -215,6 +317,144 @@ class ValidationTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def test_build_uses_one_selected_revision_per_workshop_item(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            revisions = []
+            for name, sha256, updated, content in (
+                ("old", "1" * 64, "2026-08-18T12:00:00+00:00", "old content"),
+                ("new", "2" * 64, "2026-08-19T12:00:00+00:00", "new content"),
+            ):
+                snapshot = root / "snapshots" / "111" / name
+                mod = snapshot / "mods" / "Example" / "42"
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    "name=Example Mod\nid=ExampleId\n",
+                    encoding="utf-8",
+                )
+                (mod / "content.txt").write_text(content, encoding="utf-8")
+                (snapshot / "snapshot.json").write_text(
+                    json.dumps(
+                        {
+                            "format_version": 2,
+                            "workshop_id": "111",
+                            "sha256": sha256,
+                            "snapshot_created_at_utc": updated,
+                            "workshop_updated_at_utc": updated,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                revisions.append(snapshot)
+
+            latest_output = root / "latest-output"
+            latest_report = build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="Pack",
+                    sources=tuple(revisions),
+                    output=latest_output,
+                )
+            )
+            pinned_output = root / "pinned-output"
+            build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="Pack",
+                    sources=tuple(revisions),
+                    output=pinned_output,
+                    snapshot_selections={"111": "1" * 64},
+                )
+            )
+
+            self.assertEqual(latest_report.mod_count, 1)
+            self.assertEqual(
+                (
+                    latest_output
+                    / "Contents"
+                    / "mods"
+                    / "Pack_Example"
+                    / "42"
+                    / "content.txt"
+                ).read_text(encoding="utf-8"),
+                "new content",
+            )
+            self.assertEqual(
+                (
+                    pinned_output
+                    / "Contents"
+                    / "mods"
+                    / "Pack_Example"
+                    / "42"
+                    / "content.txt"
+                ).read_text(encoding="utf-8"),
+                "old content",
+            )
+            manifest = json.loads(
+                (latest_output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["snapshot_selection"][0]["selected_sha256"],
+                "2" * 64,
+            )
+            self.assertTrue(
+                manifest["snapshot_selection"][0]["selected_is_latest"]
+            )
+            self.assertEqual(
+                manifest["mods"][0]["source_snapshot_sha256"],
+                "2" * 64,
+            )
+
+    def test_unselected_snapshot_cannot_satisfy_a_dependency(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            old = root / "snapshots" / "111" / "old"
+            old_dependent = old / "mods" / "Dependent" / "42"
+            old_framework = old / "mods" / "Framework" / "42"
+            old_dependent.mkdir(parents=True)
+            old_framework.mkdir(parents=True)
+            (old_dependent / "mod.info").write_text(
+                "id=DependentId\nrequire=FrameworkId\n",
+                encoding="utf-8",
+            )
+            (old_framework / "mod.info").write_text(
+                "id=FrameworkId\n",
+                encoding="utf-8",
+            )
+            new = root / "snapshots" / "111" / "new"
+            new_dependent = new / "mods" / "Dependent" / "42"
+            new_dependent.mkdir(parents=True)
+            (new_dependent / "mod.info").write_text(
+                "id=DependentId\nrequire=FrameworkId\n",
+                encoding="utf-8",
+            )
+            for snapshot, sha256, updated in (
+                (old, "a" * 64, "2026-08-18T12:00:00+00:00"),
+                (new, "b" * 64, "2026-08-19T12:00:00+00:00"),
+            ):
+                (snapshot / "snapshot.json").write_text(
+                    json.dumps(
+                        {
+                            "format_version": 2,
+                            "workshop_id": "111",
+                            "sha256": sha256,
+                            "workshop_updated_at_utc": updated,
+                            "snapshot_created_at_utc": updated,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with self.assertRaisesRegex(BuildError, "no discovered bundled mod"):
+                build_modpack(
+                    BuildConfig(
+                        name="Pack",
+                        namespace="Pack",
+                        sources=(old, new),
+                        output=root / "output",
+                    )
+                )
+
     def test_rebuild_versions_pack_archives_previous_output_and_detects_update(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

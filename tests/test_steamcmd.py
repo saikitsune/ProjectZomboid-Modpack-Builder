@@ -531,7 +531,190 @@ class SnapshotTests(unittest.TestCase):
                 (first.path / "mods" / "Scalies" / "mod.info").read_text(encoding="utf-8"),
                 "id=Scalies\n",
             )
-            self.assertTrue((first.path / "snapshot.json").is_file())
+            metadata = json.loads(
+                (first.path / "snapshot.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["format_version"], 2)
+            self.assertEqual(metadata["workshop_id"], "2921417999")
+            self.assertEqual(metadata["sha256"], first.sha256)
+            self.assertEqual(
+                metadata["snapshot_created_at_utc"],
+                first.snapshot_created_at_utc,
+            )
+
+    def test_existing_format_one_snapshot_is_enriched_without_changing_payload(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            downloaded = root / "downloads" / "2921417999"
+            mod_info = downloaded / "mods" / "Scalies" / "mod.info"
+            mod_info.parent.mkdir(parents=True)
+            mod_info.write_text("id=Scalies\n", encoding="utf-8")
+            first = create_snapshot(downloaded, root / "snapshots", "2921417999")
+            snapshot_mod_info = first.path / "mods" / "Scalies" / "mod.info"
+            original_payload = snapshot_mod_info.read_bytes()
+            original_payload_mtime = snapshot_mod_info.stat().st_mtime_ns
+            metadata_path = first.path / "snapshot.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "workshop_id": "2921417999",
+                        "sha256": first.sha256,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(metadata_path, (1_700_000_000, 1_700_000_000))
+
+            enriched = create_snapshot(
+                downloaded,
+                root / "snapshots",
+                "2921417999",
+                workshop_updated_at_utc="2023-11-15T01:00:00+00:00",
+                workshop_manifest_id="987654321",
+            )
+
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["format_version"], 2)
+            self.assertEqual(
+                metadata["snapshot_created_at_utc"],
+                "2023-11-14T22:13:20+00:00",
+            )
+            self.assertEqual(
+                metadata["workshop_updated_at_utc"],
+                "2023-11-15T01:00:00+00:00",
+            )
+            self.assertEqual(metadata["workshop_manifest_id"], "987654321")
+            self.assertEqual(enriched.snapshot_created_at_utc, metadata["snapshot_created_at_utc"])
+            self.assertEqual(snapshot_mod_info.read_bytes(), original_payload)
+            self.assertEqual(snapshot_mod_info.stat().st_mtime_ns, original_payload_mtime)
+
+    def test_download_records_preferred_acf_workshop_revision_metadata(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            executable = root / "steamcmd" / "steamcmd"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("", encoding="utf-8")
+            library = root / "library"
+            for workshop_id in ("111", "222"):
+                mod = (
+                    library
+                    / "steamapps"
+                    / "workshop"
+                    / "content"
+                    / "108600"
+                    / workshop_id
+                    / "mods"
+                    / f"Mod{workshop_id}"
+                )
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    f"id=Mod{workshop_id}\n",
+                    encoding="utf-8",
+                )
+            acf = library / "steamapps" / "workshop" / "appworkshop_108600.acf"
+            acf.parent.mkdir(parents=True, exist_ok=True)
+            acf.write_text(
+                '"AppWorkshop"\n'
+                "{\n"
+                '\t"WorkshopItemsInstalled"\n'
+                "\t{\n"
+                '\t\t"111"\n'
+                '\t\t{\n\t\t\t"timeupdated" "1700000000"\n'
+                '\t\t\t"manifest" "1110"\n\t\t}\n'
+                '\t\t"222"\n'
+                '\t\t{\n\t\t\t"timeupdated" "1700000100"\n'
+                '\t\t\t"manifest" "2220"\n\t\t}\n'
+                "\t}\n"
+                '\t"WorkshopItemDetails"\n'
+                "\t{\n"
+                '\t\t"111"\n'
+                '\t\t{\n\t\t\t"latest_timeupdated" "1700000200"\n'
+                '\t\t\t"latest_manifest" "1111"\n\t\t}\n'
+                '\t\t"222"\n'
+                '\t\t{\n\t\t\t"latest_timeupdated" "invalid"\n'
+                '\t\t\t"latest_manifest" "0"\n\t\t}\n'
+                "\t}\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            client = SteamCmdClient(executable, library)
+
+            with patch.object(
+                client,
+                "download",
+                return_value=SteamCmdResult(True, 0, "Success"),
+            ):
+                batch = download_and_snapshot(
+                    client,
+                    ("111", "222"),
+                    SteamCredentials.anonymous(),
+                    root / "snapshots",
+                )
+
+            first, second = batch.snapshots
+            self.assertEqual(first.workshop_updated_at_utc, "2023-11-14T22:16:40+00:00")
+            self.assertEqual(first.workshop_manifest_id, "1111")
+            self.assertEqual(second.workshop_updated_at_utc, "2023-11-14T22:15:00+00:00")
+            self.assertEqual(second.workshop_manifest_id, "2220")
+            first_metadata = json.loads(
+                (first.path / "snapshot.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                first_metadata["workshop_updated_at_utc"],
+                first.workshop_updated_at_utc,
+            )
+            self.assertEqual(
+                first_metadata["workshop_manifest_id"],
+                first.workshop_manifest_id,
+            )
+
+    def test_malformed_acf_does_not_block_snapshot_creation(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            executable = root / "steamcmd" / "steamcmd"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("", encoding="utf-8")
+            library = root / "library"
+            mod = (
+                library
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / "108600"
+                / "111"
+                / "mods"
+                / "Mod111"
+            )
+            mod.mkdir(parents=True)
+            (mod / "mod.info").write_text("id=Mod111\n", encoding="utf-8")
+            acf = library / "steamapps" / "workshop" / "appworkshop_108600.acf"
+            acf.parent.mkdir(parents=True, exist_ok=True)
+            acf.write_text('"AppWorkshop" { broken', encoding="utf-8")
+            client = SteamCmdClient(executable, library)
+
+            with patch.object(
+                client,
+                "download",
+                return_value=SteamCmdResult(True, 0, "Success"),
+            ):
+                batch = download_and_snapshot(
+                    client,
+                    ("111",),
+                    SteamCredentials.anonymous(),
+                    root / "snapshots",
+                )
+
+            snapshot = batch.snapshots[0]
+            metadata = json.loads(
+                (snapshot.path / "snapshot.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["format_version"], 2)
+            self.assertIn("snapshot_created_at_utc", metadata)
+            self.assertIsNone(snapshot.workshop_updated_at_utc)
+            self.assertIsNone(snapshot.workshop_manifest_id)
+            self.assertNotIn("workshop_updated_at_utc", metadata)
+            self.assertNotIn("workshop_manifest_id", metadata)
 
     def test_download_batch_creates_snapshots_for_each_item(self) -> None:
         with TemporaryDirectory() as temporary_directory:

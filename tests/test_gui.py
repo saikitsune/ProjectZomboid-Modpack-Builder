@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -13,7 +14,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit
 
 from pzmodpack.backend import BuildReport, discover_mods
-from pzmodpack.gui import BundledModSelectionDialog, ModpackWindow
+from pzmodpack.gui import (
+    BundledModSelectionDialog,
+    ModpackWindow,
+    WorkshopSnapshotSelectionDialog,
+)
 from pzmodpack.project import load_project
 from pzmodpack.steamcmd import (
     DownloadBatchResult,
@@ -37,7 +42,7 @@ class GuiTests(unittest.TestCase):
             (mod / "mod.info").write_text("name=Example\nid=ExampleId\n", encoding="utf-8")
             destination = root / "built"
             window = ModpackWindow(run_async=False, persist_session=False)
-            self.assertIn("v0.6.0", window.windowTitle())
+            self.assertIn("v0.6.1", window.windowTitle())
             window.name_edit.setText("GUI Pack")
             window.namespace_edit.setText("GuiPack")
             window.workshop_edit.setText("123")
@@ -134,6 +139,137 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(dialog.selected_mod_ids(), ("WaterpipesRemoved",))
             self.assertIn("Deselected incompatible", dialog.status.text())
             dialog.close()
+
+    def test_snapshot_dialog_groups_revisions_and_marks_latest_with_dates(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshots = []
+            for name, sha256, updated in (
+                ("old", "a" * 64, "2026-08-18T12:00:00+00:00"),
+                ("latest", "b" * 64, "2026-08-19T12:00:00+00:00"),
+            ):
+                snapshot = root / "snapshots" / "111" / name
+                mod = snapshot / "mods" / "Example" / "42"
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    "name=Example Mod\nid=ExampleId\n",
+                    encoding="utf-8",
+                )
+                (snapshot / "snapshot.json").write_text(
+                    json.dumps(
+                        {
+                            "format_version": 2,
+                            "workshop_id": "111",
+                            "sha256": sha256,
+                            "snapshot_created_at_utc": updated,
+                            "workshop_updated_at_utc": updated,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                snapshots.append(snapshot)
+
+            dialog = WorkshopSnapshotSelectionDialog(
+                discover_mods(snapshots),
+            )
+            item = dialog.tree.topLevelItem(0)
+            combo = dialog._combos["111"]
+
+            self.assertEqual(dialog.tree.topLevelItemCount(), 1)
+            self.assertEqual(combo.count(), 2)
+            self.assertEqual(combo.currentData(), "b" * 64)
+            self.assertIn("LATEST", combo.currentText())
+            self.assertIn("2026-08-19", item.text(2))
+            self.assertEqual(item.text(4), "Latest downloaded")
+
+            combo.setCurrentIndex(1)
+
+            self.assertEqual(dialog.selected_revisions(), {"111": "a" * 64})
+            self.assertIn("2026-08-18", item.text(2))
+            self.assertEqual(item.text(4), "Pinned older snapshot")
+            dialog.close()
+
+    def test_snapshot_dialog_labels_legacy_workshop_date_unknown(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            snapshot = Path(temporary_directory) / "snapshots" / "111" / "legacy"
+            mod = snapshot / "mods" / "Example" / "42"
+            mod.mkdir(parents=True)
+            (mod / "mod.info").write_text("id=ExampleId\n", encoding="utf-8")
+            (snapshot / "snapshot.json").write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "workshop_id": "111",
+                        "sha256": "a" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            dialog = WorkshopSnapshotSelectionDialog(discover_mods((snapshot,)))
+            item = dialog.tree.topLevelItem(0)
+
+            self.assertEqual(item.text(2), "Unknown")
+            self.assertNotEqual(item.text(3), "Unknown")
+            dialog.close()
+
+    def test_build_prompts_once_and_bundles_only_latest_snapshot_revision(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshots = []
+            for name, sha256, updated, content in (
+                ("old", "a" * 64, "2026-08-18T12:00:00+00:00", "old"),
+                ("latest", "b" * 64, "2026-08-19T12:00:00+00:00", "latest"),
+            ):
+                snapshot = root / "snapshots" / "111" / name
+                mod = snapshot / "mods" / "Example" / "42"
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    "name=Example Mod\nid=ExampleId\n",
+                    encoding="utf-8",
+                )
+                (mod / "content.txt").write_text(content, encoding="utf-8")
+                (snapshot / "snapshot.json").write_text(
+                    json.dumps(
+                        {
+                            "format_version": 2,
+                            "workshop_id": "111",
+                            "sha256": sha256,
+                            "snapshot_created_at_utc": updated,
+                            "workshop_updated_at_utc": updated,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                snapshots.append(snapshot)
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.output_edit.setText(str(root / "output"))
+            for snapshot in snapshots:
+                window.add_source_path(snapshot)
+
+            with patch.object(
+                WorkshopSnapshotSelectionDialog,
+                "exec",
+                return_value=WorkshopSnapshotSelectionDialog.DialogCode.Accepted,
+            ) as execute:
+                window.build_pack()
+
+            execute.assert_called_once()
+            self.assertEqual(window.snapshot_selections, {"111": "b" * 64})
+            self.assertEqual(
+                (
+                    root
+                    / "output"
+                    / "Contents"
+                    / "mods"
+                    / "MyPack_Example"
+                    / "42"
+                    / "content.txt"
+                ).read_text(encoding="utf-8"),
+                "latest",
+            )
+            self.assertNotIn("duplicate", window.log.toPlainText().lower())
+            window.close()
 
     def test_bundled_mod_dialog_auto_selects_and_locks_required_mods(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -283,7 +419,7 @@ class GuiTests(unittest.TestCase):
             window.test_steam_login()
         log = window.log.toPlainText()
         self.assertIn("Steam login succeeded", log)
-        self.assertIn("PZ Modpack Builder v0.6.0", log)
+        self.assertIn("PZ Modpack Builder v0.6.1", log)
         self.assertNotIn("super-secret", log)
         self.assertNotIn("ABCDE", log)
         self.assertEqual(window.password_edit.text(), "")
@@ -332,6 +468,91 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(window.source_paths(), (snapshot_path.resolve(),))
             self.assertEqual(download.call_args.args[1], ("111",))
             self.assertIn("Locked Workshop 111", window.log.toPlainText())
+            window.close()
+
+    def test_new_download_follows_latest_unless_older_snapshot_is_pinned(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+
+            def make_snapshot(name: str, sha256: str, updated: str) -> Path:
+                snapshot = root / "snapshots" / "111" / name
+                mod = snapshot / "mods" / "Example" / "42"
+                mod.mkdir(parents=True)
+                (mod / "mod.info").write_text(
+                    "name=Example\nid=ExampleId\n",
+                    encoding="utf-8",
+                )
+                (snapshot / "snapshot.json").write_text(
+                    json.dumps(
+                        {
+                            "format_version": 2,
+                            "workshop_id": "111",
+                            "sha256": sha256,
+                            "snapshot_created_at_utc": updated,
+                            "workshop_updated_at_utc": updated,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return snapshot
+
+            old_hash = "a" * 64
+            new_hash = "b" * 64
+            newest_hash = "c" * 64
+            old = make_snapshot("old", old_hash, "2026-08-17T12:00:00+00:00")
+            new = make_snapshot("new", new_hash, "2026-08-18T12:00:00+00:00")
+            newest = make_snapshot(
+                "newest",
+                newest_hash,
+                "2026-08-19T12:00:00+00:00",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.workshop_input.setPlainText("111")
+            window.add_source_path(old)
+            window.snapshot_selections = {"111": old_hash}
+            window.included_mod_ids = ("ExampleId",)
+
+            first_batch = DownloadBatchResult(
+                SteamCmdResult(True, 0, "Downloaded"),
+                (
+                    WorkshopSnapshot(
+                        "111",
+                        new_hash,
+                        new,
+                        "2026-08-18T12:05:00+00:00",
+                        "2026-08-18T12:00:00+00:00",
+                    ),
+                ),
+            )
+            with patch(
+                "pzmodpack.gui.download_and_snapshot",
+                return_value=first_batch,
+            ):
+                window.download_workshop_items()
+
+            self.assertEqual(window.snapshot_selections, {"111": new_hash})
+            self.assertEqual(window.included_mod_ids, ("ExampleId",))
+
+            window.snapshot_selections = {"111": old_hash}
+            second_batch = DownloadBatchResult(
+                SteamCmdResult(True, 0, "Downloaded"),
+                (
+                    WorkshopSnapshot(
+                        "111",
+                        newest_hash,
+                        newest,
+                        "2026-08-19T12:05:00+00:00",
+                        "2026-08-19T12:00:00+00:00",
+                    ),
+                ),
+            )
+            with patch(
+                "pzmodpack.gui.download_and_snapshot",
+                return_value=second_batch,
+            ):
+                window.download_workshop_items()
+
+            self.assertEqual(window.snapshot_selections, {"111": old_hash})
             window.close()
 
     def test_async_workshop_download_shows_live_progress(self) -> None:

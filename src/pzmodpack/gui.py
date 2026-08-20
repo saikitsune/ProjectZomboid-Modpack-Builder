@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -39,13 +40,16 @@ from .backend import (
     BundledModConflict,
     BundledModRequirement,
     DiscoveredMod,
+    WorkshopSnapshotRevision,
     build_modpack,
     discover_mods,
     find_bundled_conflicts,
     find_mod_requirements,
+    resolve_workshop_snapshots,
     select_mods,
     validate_mods,
     validate_mod_selection,
+    workshop_snapshot_groups,
 )
 from .project import ProjectSettings, load_project, save_project
 from .session import (
@@ -126,6 +130,155 @@ class BuildWorker(QThread):
             self.succeeded.emit(report)
         except Exception as error:  # noqa: BLE001 - Qt thread boundary must report all failures.
             self.failed.emit(str(error))
+
+
+def _display_snapshot_time(value: str | None) -> str:
+    if not value:
+        return "Unknown"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
+
+
+class WorkshopSnapshotSelectionDialog(QDialog):
+    def __init__(
+        self,
+        mods: list[DiscoveredMod],
+        selections: dict[str, str] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select Workshop snapshot versions")
+        self.resize(1120, 520)
+        self._groups = workshop_snapshot_groups(mods)
+        self._combos: dict[str, QComboBox] = {}
+        self._items: dict[str, QTreeWidgetItem] = {}
+        requested = selections or {}
+
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Each Workshop item is one bundled source. Choose exactly one immutable "
+            "snapshot version for it. The newest downloaded Workshop revision is "
+            "selected by default; older snapshots remain available for rollback."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(
+            (
+                "Workshop item",
+                "Snapshot version",
+                "Workshop updated",
+                "Snapshot captured",
+                "Status",
+            )
+        )
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        for workshop_id, revisions in self._groups.items():
+            item = QTreeWidgetItem(self.tree)
+            names = sorted(
+                {
+                    mod.display_name or mod.folder_name
+                    for revision in revisions
+                    for mod in revision.mods
+                },
+                key=str.casefold,
+            )
+            name_summary = ", ".join(names[:2])
+            if len(names) > 2:
+                name_summary += f" (+{len(names) - 2} more)"
+            item.setText(0, f"{workshop_id} — {name_summary}")
+            combo = QComboBox()
+            for index, revision in enumerate(revisions):
+                combo.addItem(
+                    self._revision_label(revision, is_latest=index == 0),
+                    revision.revision_key,
+                )
+            selected_index = combo.findData(requested.get(workshop_id))
+            combo.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+            combo.currentIndexChanged.connect(
+                lambda _index, item_id=workshop_id: self._update_row(item_id)
+            )
+            self.tree.setItemWidget(item, 1, combo)
+            self._combos[workshop_id] = combo
+            self._items[workshop_id] = item
+            self._update_row(workshop_id)
+
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 3, 4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.tree, 1)
+
+        note = QLabel(
+            "Workshop update dates come from Steam's local Workshop manifest when "
+            "available. Legacy snapshots show Unknown rather than guessing from a "
+            "filesystem timestamp; their displayed capture time may be inferred from "
+            "the legacy snapshot metadata file."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    @staticmethod
+    def _revision_label(
+        revision: WorkshopSnapshotRevision,
+        *,
+        is_latest: bool,
+    ) -> str:
+        status = "LATEST" if is_latest else "Older"
+        short_hash = (revision.sha256 or revision.revision_key)[0:12]
+        return f"{status} — {short_hash}"
+
+    def _selected_revision(self, workshop_id: str) -> WorkshopSnapshotRevision:
+        combo = self._combos[workshop_id]
+        selected_key = str(combo.currentData())
+        return next(
+            revision
+            for revision in self._groups[workshop_id]
+            if revision.revision_key == selected_key
+        )
+
+    def _update_row(self, workshop_id: str) -> None:
+        if workshop_id not in self._combos:
+            return
+        revision = self._selected_revision(workshop_id)
+        item = self._items[workshop_id]
+        latest = revision is self._groups[workshop_id][0]
+        item.setText(2, _display_snapshot_time(revision.workshop_updated_at_utc))
+        item.setText(3, _display_snapshot_time(revision.snapshot_created_at_utc))
+        item.setText(4, "Latest downloaded" if latest else "Pinned older snapshot")
+        details = (
+            f"Source: {revision.source_root}\n"
+            f"Full SHA-256: {revision.sha256 or 'Unavailable'}\n"
+            f"Workshop manifest: {revision.workshop_manifest_id or 'Unavailable'}\n"
+            f"Workshop updated: "
+            f"{_display_snapshot_time(revision.workshop_updated_at_utc)}\n"
+            f"Snapshot captured: "
+            f"{_display_snapshot_time(revision.snapshot_created_at_utc)}"
+        )
+        for column in range(self.tree.columnCount()):
+            item.setToolTip(column, details)
+
+    def selected_revisions(self) -> dict[str, str]:
+        return {
+            workshop_id: str(combo.currentData())
+            for workshop_id, combo in self._combos.items()
+        }
 
 
 class BundledModSelectionDialog(QDialog):
@@ -540,6 +693,12 @@ class BundledModSelectionDialog(QDialog):
             f"Mod ID(s): {'; '.join(mod.mod_ids)}",
             f"Active Mod ID: {self._active_mod_id(mod)}",
             f"Workshop item: {mod.workshop_id or 'local source'}",
+            f"Snapshot SHA-256: {mod.snapshot_sha256 or 'local/unavailable'}",
+            f"Workshop manifest: {mod.workshop_manifest_id or 'Unavailable'}",
+            "Workshop updated: "
+            f"{_display_snapshot_time(mod.workshop_updated_at_utc)}",
+            "Snapshot captured: "
+            f"{_display_snapshot_time(mod.snapshot_created_at_utc)}",
             f"Requires: {self._requirement_summary(mod)}",
             f"Conflicts with: {self._conflict_summary(mod)}",
         ]
@@ -615,6 +774,7 @@ class ModpackWindow(QMainWindow):
             "Optional active Mod ID overrides, one per line: FolderName=ModId"
         )
         self.included_mod_ids: tuple[str, ...] | None = None
+        self.snapshot_selections: dict[str, str] = {}
         self.source_list = QListWidget()
         self.source_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
 
@@ -729,10 +889,10 @@ class ModpackWindow(QMainWindow):
         bundled_mod_row = QHBoxLayout()
         self.mod_selection_label = QLabel("All discovered bundled mods")
         bundled_mod_row.addWidget(self.mod_selection_label, 1)
-        select_bundled_mods = QPushButton("Select bundled mods...")
+        select_bundled_mods = QPushButton("Select snapshots and bundled mods...")
         select_bundled_mods.clicked.connect(self.select_bundled_mods)
         bundled_mod_row.addWidget(select_bundled_mods)
-        form.addRow("Bundled mod selection", bundled_mod_row)
+        form.addRow("Snapshot and mod selection", bundled_mod_row)
         output_row = QHBoxLayout()
         output_row.addWidget(self.output_edit, 1)
         browse_output = QPushButton("Browse...")
@@ -970,6 +1130,7 @@ class ModpackWindow(QMainWindow):
             active_mod_ids=self.active_mod_id_overrides(),
             included_mod_ids=self.included_mod_ids,
             version_bump=str(self.version_bump_combo.currentData()),
+            snapshot_selections=self.snapshot_selections,
         )
 
     def save_project_to(self, path: Path) -> None:
@@ -999,6 +1160,7 @@ class ModpackWindow(QMainWindow):
         for source in settings.sources:
             self.add_source_path(source)
         self.included_mod_ids = settings.included_mod_ids
+        self.snapshot_selections = dict(settings.snapshot_selections)
         version_bump_index = self.version_bump_combo.findData(settings.version_bump)
         self.version_bump_combo.setCurrentIndex(
             version_bump_index if version_bump_index >= 0 else 0
@@ -1039,13 +1201,19 @@ class ModpackWindow(QMainWindow):
     def source_paths(self) -> tuple[Path, ...]:
         return tuple(Path(self.source_list.item(index).text()) for index in range(self.source_list.count()))
 
-    def add_source_path(self, path: Path) -> None:
+    def add_source_path(
+        self,
+        path: Path,
+        *,
+        preserve_mod_selection: bool = False,
+    ) -> None:
         resolved = str(Path(path).resolve())
         existing = {self.source_list.item(index).text() for index in range(self.source_list.count())}
         if resolved not in existing:
             self.source_list.addItem(resolved)
-            self.included_mod_ids = None
-            self._update_mod_selection_label()
+            if not preserve_mod_selection:
+                self.included_mod_ids = None
+                self._update_mod_selection_label()
 
     def add_source_dialog(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select Workshop item or mod source")
@@ -1059,6 +1227,21 @@ class ModpackWindow(QMainWindow):
             removed = True
         if removed:
             self.included_mod_ids = None
+            try:
+                groups = workshop_snapshot_groups(
+                    discover_mods(self.source_paths())
+                )
+            except OSError:
+                groups = {}
+            self.snapshot_selections = {
+                workshop_id: revision
+                for workshop_id, revision in self.snapshot_selections.items()
+                if workshop_id in groups
+                and any(
+                    candidate.revision_key == revision
+                    for candidate in groups[workshop_id]
+                )
+            }
             self._update_mod_selection_label()
 
     def choose_output(self) -> None:
@@ -1266,11 +1449,36 @@ class ModpackWindow(QMainWindow):
             if not batch.command_result.success:
                 self.log.appendPlainText("SteamCMD did not complete the download successfully.")
                 return
+            existing_groups = workshop_snapshot_groups(
+                discover_mods(self.source_paths())
+            )
             for snapshot in batch.snapshots:
-                self.add_source_path(snapshot.path)
+                previous_revisions = existing_groups.get(snapshot.workshop_id, ())
+                previous_latest = (
+                    previous_revisions[0].revision_key
+                    if previous_revisions
+                    else None
+                )
+                previous_selection = self.snapshot_selections.get(
+                    snapshot.workshop_id
+                )
+                followed_latest = (
+                    previous_selection is None
+                    or previous_selection == previous_latest
+                )
+                self.add_source_path(
+                    snapshot.path,
+                    preserve_mod_selection=bool(previous_revisions),
+                )
+                if followed_latest:
+                    self.snapshot_selections[snapshot.workshop_id] = snapshot.sha256
                 self.log.appendPlainText(
                     f"Locked Workshop {snapshot.workshop_id} as "
-                    f"{snapshot.sha256[:16]} at {snapshot.path}"
+                    f"{snapshot.sha256[:16]} at {snapshot.path}\n"
+                    f"  Workshop updated: "
+                    f"{_display_snapshot_time(snapshot.workshop_updated_at_utc)}\n"
+                    f"  Snapshot captured: "
+                    f"{_display_snapshot_time(snapshot.snapshot_created_at_utc)}"
                 )
 
         def failed(message: str) -> None:
@@ -1383,13 +1591,90 @@ class ModpackWindow(QMainWindow):
         if not hasattr(self, "mod_selection_label"):
             return
         if self.included_mod_ids is None:
-            self.mod_selection_label.setText("All discovered bundled mods")
+            label = "All discovered bundled mods"
         else:
-            self.mod_selection_label.setText(
-                f"Custom selection ({len(self.included_mod_ids)} Mod ID(s))"
+            label = f"Custom selection ({len(self.included_mod_ids)} Mod ID(s))"
+        if self.snapshot_selections:
+            label += (
+                f"; {len(self.snapshot_selections)} Workshop snapshot revision(s) "
+                "chosen"
             )
+        self.mod_selection_label.setText(label)
 
-    def _show_mod_selection_dialog(
+    def _snapshot_selections_need_review(
+        self,
+        mods: list[DiscoveredMod],
+    ) -> bool:
+        groups = workshop_snapshot_groups(mods)
+        if set(self.snapshot_selections) - set(groups):
+            return True
+        for workshop_id, revisions in groups.items():
+            selected = self.snapshot_selections.get(workshop_id)
+            if len(revisions) > 1 and selected is None:
+                return True
+            if selected is not None and not any(
+                revision.revision_key == selected for revision in revisions
+            ):
+                return True
+        return False
+
+    def _show_snapshot_selection_dialog(
+        self,
+        mods: list[DiscoveredMod],
+        *,
+        force: bool,
+    ) -> list[DiscoveredMod] | None:
+        groups = workshop_snapshot_groups(mods)
+        if not groups:
+            if self.snapshot_selections:
+                self.snapshot_selections = {}
+                self._update_mod_selection_label()
+            return mods
+        if not force and not self._snapshot_selections_need_review(mods):
+            selected, _effective = resolve_workshop_snapshots(
+                mods,
+                self.snapshot_selections,
+            )
+            return selected
+
+        try:
+            _previous_mods, previous_effective = resolve_workshop_snapshots(
+                mods,
+                self.snapshot_selections,
+            )
+        except BuildError:
+            previous_effective = {}
+        dialog = WorkshopSnapshotSelectionDialog(
+            mods,
+            self.snapshot_selections,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        selected_revisions = dialog.selected_revisions()
+        selected_mods, effective = resolve_workshop_snapshots(
+            mods,
+            selected_revisions,
+        )
+        if effective != previous_effective:
+            self.included_mod_ids = None
+            self._update_mod_selection_label()
+        self.snapshot_selections = selected_revisions
+        self._update_mod_selection_label()
+        for workshop_id, revisions in groups.items():
+            selected = next(
+                revision
+                for revision in revisions
+                if revision.revision_key == effective[workshop_id]
+            )
+            status = "latest" if selected is revisions[0] else "older pinned"
+            self.log.appendPlainText(
+                f"Workshop {workshop_id}: selected {status} snapshot "
+                f"{selected.revision_key[:12]}."
+            )
+        return selected_mods
+
+    def _show_bundled_mod_selection_dialog(
         self,
         mods: list[DiscoveredMod],
         active_mod_ids: dict[str, str],
@@ -1409,6 +1694,22 @@ class ModpackWindow(QMainWindow):
             f"Selected {selected_count} of {len(mods)} bundled mod folder(s)."
         )
         return True
+
+    def _show_mod_selection_dialog(
+        self,
+        mods: list[DiscoveredMod],
+        active_mod_ids: dict[str, str],
+    ) -> bool:
+        selected_snapshots = self._show_snapshot_selection_dialog(
+            mods,
+            force=True,
+        )
+        if selected_snapshots is None:
+            return False
+        return self._show_bundled_mod_selection_dialog(
+            selected_snapshots,
+            active_mod_ids,
+        )
 
     def select_bundled_mods(self) -> None:
         self.log.clear()
@@ -1430,12 +1731,31 @@ class ModpackWindow(QMainWindow):
     def scan_sources(self) -> None:
         self.log.clear()
         try:
-            mods = discover_mods(self.source_paths())
+            all_mods = discover_mods(self.source_paths())
+            mods, effective_snapshots = resolve_workshop_snapshots(
+                all_mods,
+                self.snapshot_selections,
+            )
             issues = validate_mods(mods, self.active_mod_id_overrides())
-        except (OSError, ValueError) as error:
+        except (BuildError, OSError, ValueError) as error:
             self.log.appendPlainText(f"Scan failed: {error}")
             return
         self.log.appendPlainText(f"Discovered {len(mods)} mod folder(s).")
+        for workshop_id, revisions in workshop_snapshot_groups(all_mods).items():
+            selected = next(
+                revision
+                for revision in revisions
+                if revision.revision_key == effective_snapshots[workshop_id]
+            )
+            latest = selected is revisions[0]
+            self.log.appendPlainText(
+                f"  Workshop {workshop_id}: using "
+                f"{'latest' if latest else 'pinned older'} snapshot "
+                f"{selected.revision_key[:12]} of {len(revisions)}; "
+                f"Workshop updated "
+                f"{_display_snapshot_time(selected.workshop_updated_at_utc)}; "
+                f"captured {_display_snapshot_time(selected.snapshot_created_at_utc)}"
+            )
         for mod in mods:
             self.log.appendPlainText(f"  {mod.folder_name}: {';'.join(mod.mod_ids)}")
         if not self.active_ids_edit.toPlainText().strip():
@@ -1453,7 +1773,8 @@ class ModpackWindow(QMainWindow):
             self.log.appendPlainText(f"{issue.severity.upper()}: {issue.message}")
         if any(issue.code == "bundled_incompatibility" for issue in issues):
             self.log.appendPlainText(
-                "Use 'Select bundled mods...' to choose compatible alternatives."
+                "Use 'Select snapshots and bundled mods...' to choose compatible "
+                "alternatives."
             )
         if any(issue.code == "missing_required_mod" for issue in issues):
             self.log.appendPlainText(
@@ -1526,7 +1847,16 @@ class ModpackWindow(QMainWindow):
             self.log.appendPlainText("Build failed: add at least one source folder.")
             return
         try:
-            discovered_mods = discover_mods(self.source_paths())
+            all_discovered_mods = discover_mods(self.source_paths())
+            discovered_mods = self._show_snapshot_selection_dialog(
+                all_discovered_mods,
+                force=self._snapshot_selections_need_review(all_discovered_mods),
+            )
+            if discovered_mods is None:
+                self.log.appendPlainText(
+                    "Build cancelled before changing the output."
+                )
+                return
             active_mod_ids = self.active_mod_id_overrides()
             selected_mods = select_mods(discovered_mods, self.included_mod_ids)
             selected_conflicts = find_bundled_conflicts(selected_mods)
@@ -1551,7 +1881,7 @@ class ModpackWindow(QMainWindow):
                         f"Review {len(requirement_issues)} required-mod issue(s) before "
                         "building."
                     )
-                if not self._show_mod_selection_dialog(
+                if not self._show_bundled_mod_selection_dialog(
                     discovered_mods,
                     active_mod_ids,
                 ):
@@ -1573,8 +1903,9 @@ class ModpackWindow(QMainWindow):
                 active_mod_ids=active_mod_ids,
                 included_mod_ids=self.included_mod_ids,
                 version_bump=str(self.version_bump_combo.currentData()),
+                snapshot_selections=self.snapshot_selections,
             )
-        except (OSError, ValueError) as error:
+        except (BuildError, OSError, ValueError) as error:
             self.log.appendPlainText(f"Build failed: {error}")
             return
 

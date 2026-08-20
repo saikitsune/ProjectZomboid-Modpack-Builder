@@ -7,7 +7,13 @@ from collections.abc import Sequence
 from getpass import getpass
 from pathlib import Path
 
-from .backend import BuildConfig, BuildError, build_modpack, discover_mods
+from .backend import (
+    BuildConfig,
+    BuildError,
+    build_modpack,
+    discover_mods,
+    resolve_workshop_snapshots,
+)
 from .steamcmd import (
     SteamCmdClient,
     SteamCredentials,
@@ -27,6 +33,13 @@ def _parser() -> argparse.ArgumentParser:
     scan = commands.add_parser("scan", help="Inspect one or more mod source directories")
     scan.add_argument("sources", nargs="+", type=Path)
     scan.add_argument("--json", action="store_true", dest="as_json")
+    scan.add_argument(
+        "--snapshot-revision",
+        action="append",
+        default=[],
+        metavar="WORKSHOP_ID=SHA256",
+        help="Select a specific immutable revision instead of the latest",
+    )
     build = commands.add_parser("build", help="Build a namespaced Workshop upload directory")
     build.add_argument("--name", required=True)
     build.add_argument("--namespace", required=True)
@@ -41,6 +54,13 @@ def _parser() -> argparse.ArgumentParser:
         choices=("major", "minor", "patch"),
         default="patch",
         help="Semantic version component to advance when rebuilding an existing output",
+    )
+    build.add_argument(
+        "--snapshot-revision",
+        action="append",
+        default=[],
+        metavar="WORKSHOP_ID=SHA256",
+        help="Select a specific immutable revision instead of the latest",
     )
     build.add_argument(
         "--active-id",
@@ -123,16 +143,43 @@ def _active_overrides(values: list[str]) -> dict[str, str]:
     return overrides
 
 
+def _snapshot_revisions(values: list[str]) -> dict[str, str]:
+    selections: dict[str, str] = {}
+    for value in values:
+        workshop_id, separator, revision = value.partition("=")
+        if (
+            not separator
+            or not workshop_id.strip().isdigit()
+            or not revision.strip()
+        ):
+            raise ValueError(
+                f"Invalid --snapshot-revision value {value!r}; use WORKSHOP_ID=SHA256"
+            )
+        selections[workshop_id.strip()] = revision.strip()
+    return selections
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "scan":
-        mods = discover_mods(args.sources)
+        try:
+            mods, _effective = resolve_workshop_snapshots(
+                discover_mods(args.sources),
+                _snapshot_revisions(args.snapshot_revision),
+            )
+        except (BuildError, ValueError) as error:
+            print(f"Scan failed: {error}", file=sys.stderr)
+            return 2
         payload = [
             {
                 "source_root": str(mod.source_root),
                 "folder_name": mod.folder_name,
                 "mod_ids": list(mod.mod_ids),
                 "workshop_id": mod.workshop_id,
+                "snapshot_sha256": mod.snapshot_sha256,
+                "snapshot_created_at_utc": mod.snapshot_created_at_utc,
+                "workshop_updated_at_utc": mod.workshop_updated_at_utc,
+                "workshop_manifest_id": mod.workshop_manifest_id,
             }
             for mod in mods
         ]
@@ -161,6 +208,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         else None
                     ),
                     version_bump=args.version_bump,
+                    snapshot_selections=_snapshot_revisions(
+                        args.snapshot_revision
+                    ),
                 )
             )
         except (BuildError, ValueError) as error:
