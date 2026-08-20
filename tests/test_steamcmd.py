@@ -10,6 +10,8 @@ import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from urllib.error import URLError
+from urllib.parse import parse_qs
 
 from pzmodpack.steamcmd import (
     SteamCmdClient,
@@ -30,6 +32,7 @@ from pzmodpack.steamcmd import (
     install_steamcmd,
     list_stored_workshop_snapshots,
     parse_workshop_ids,
+    query_workshop_item_details,
     redact_secrets,
     upload_modpack,
     write_upload_vdf,
@@ -113,6 +116,248 @@ class WorkshopIdTests(unittest.TestCase):
             parse_workshop_ids(values),
             ("2921417999", "3778832646", "3781771367"),
         )
+
+
+class WorkshopDetailsQueryTests(unittest.TestCase):
+    def test_query_deduplicates_input_preserves_order_and_parses_remote_metadata(
+        self,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fetch(form_data: bytes, timeout: int) -> bytes:
+            captured["timeout"] = timeout
+            captured["form"] = parse_qs(form_data.decode("ascii"))
+            return json.dumps(
+                {
+                    "response": {
+                        "result": 1,
+                        "resultcount": 2,
+                        "publishedfiledetails": [
+                            {
+                                "publishedfileid": "222",
+                                "result": 1,
+                                "title": "Second mod",
+                                "time_updated": "1700000100",
+                                "hcontent_file": "9002",
+                                "consumer_app_id": 108600,
+                                "banned": 0,
+                                "visibility": 2,
+                            },
+                            {
+                                "publishedfileid": "111",
+                                "result": 1,
+                                "title": " First mod ",
+                                "time_updated": 1700000000,
+                                "hcontent_file": 9001,
+                                "consumer_app_id": "108600",
+                                "banned": "false",
+                                "visibility": "0",
+                            },
+                        ],
+                    }
+                }
+            ).encode("utf-8")
+
+        result = query_workshop_item_details(
+            ("111", "222", "111"),
+            timeout=7,
+            fetcher=fetch,
+        )
+
+        self.assertEqual([item.workshop_id for item in result.items], ["111", "222"])
+        self.assertEqual(result.warnings, ())
+        self.assertEqual(captured["timeout"], 7)
+        form = captured["form"]
+        self.assertEqual(
+            form,
+            {
+                "itemcount": ["2"],
+                "publishedfileids[0]": ["111"],
+                "publishedfileids[1]": ["222"],
+                "format": ["json"],
+            },
+        )
+        self.assertFalse(
+            any(
+                secret in key.casefold()
+                for key in form
+                for secret in ("key", "user", "password", "guard", "login")
+            )
+        )
+        first, second = result.items
+        self.assertTrue(first.is_available)
+        self.assertEqual(first.title, "First mod")
+        self.assertEqual(
+            first.workshop_updated_at_utc,
+            "2023-11-14T22:13:20+00:00",
+        )
+        self.assertEqual(first.workshop_manifest_id, "9001")
+        self.assertEqual(first.consumer_app_id, "108600")
+        self.assertFalse(first.banned)
+        self.assertEqual(first.visibility, 0)
+        self.assertEqual(second.workshop_manifest_id, "9002")
+
+    def test_query_preserves_unavailable_wrong_app_and_missing_items(self) -> None:
+        def fetch(_form_data: bytes, _timeout: int) -> bytes:
+            return json.dumps(
+                {
+                    "response": {
+                        "result": 1,
+                        "resultcount": 3,
+                        "publishedfiledetails": [
+                            {"publishedfileid": "111", "result": 9},
+                            {
+                                "publishedfileid": "222",
+                                "result": 1,
+                                "consumer_app_id": "123",
+                            },
+                            {"publishedfileid": "333", "result": 1},
+                        ],
+                    }
+                }
+            ).encode("utf-8")
+
+        result = query_workshop_item_details(
+            ("111", "222", "333", "444"),
+            fetcher=fetch,
+        )
+
+        self.assertEqual(
+            [item.workshop_id for item in result.items],
+            ["111", "222", "333", "444"],
+        )
+        unavailable, wrong_app, missing_app, missing = result.items
+        self.assertEqual(unavailable.result, 9)
+        self.assertFalse(unavailable.is_available)
+        self.assertEqual(wrong_app.consumer_app_id, "123")
+        self.assertFalse(wrong_app.is_available)
+        self.assertIsNone(missing_app.consumer_app_id)
+        self.assertFalse(missing_app.is_available)
+        self.assertIsNone(missing.result)
+        self.assertIn("no details", missing.error or "")
+        self.assertFalse(missing.is_available)
+        self.assertTrue(any("Workshop 444" in warning for warning in result.warnings))
+
+    def test_query_retries_transient_network_errors_without_losing_items(self) -> None:
+        attempts = 0
+        delays: list[float] = []
+
+        def fetch(_form_data: bytes, _timeout: int) -> bytes:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise URLError("temporarily offline")
+            return json.dumps(
+                {
+                    "response": {
+                        "result": 1,
+                        "resultcount": 1,
+                        "publishedfiledetails": [
+                            {
+                                "publishedfileid": "111",
+                                "result": 1,
+                                "consumer_app_id": 108600,
+                            }
+                        ],
+                    }
+                }
+            ).encode("utf-8")
+
+        result = query_workshop_item_details(
+            ("111",),
+            fetcher=fetch,
+            sleeper=delays.append,
+        )
+
+        self.assertEqual(attempts, 3)
+        self.assertEqual(delays, [0.25, 0.5])
+        self.assertEqual([item.workshop_id for item in result.items], ["111"])
+        self.assertTrue(result.items[0].is_available)
+        self.assertEqual(result.warnings, ())
+
+    def test_query_preserves_each_item_after_network_retries_are_exhausted(
+        self,
+    ) -> None:
+        attempts = 0
+        delays: list[float] = []
+
+        def fetch(_form_data: bytes, _timeout: int) -> bytes:
+            nonlocal attempts
+            attempts += 1
+            raise URLError("offline")
+
+        result = query_workshop_item_details(
+            ("111", "222"),
+            fetcher=fetch,
+            sleeper=delays.append,
+        )
+
+        self.assertEqual(attempts, 3)
+        self.assertEqual(delays, [0.25, 0.5])
+        self.assertEqual(
+            [item.workshop_id for item in result.items],
+            ["111", "222"],
+        )
+        self.assertTrue(
+            all(
+                "Could not contact Steam Web API" in (item.error or "")
+                for item in result.items
+            )
+        )
+        self.assertEqual(len(result.warnings), 1)
+
+    def test_query_preserves_each_item_when_response_is_malformed(self) -> None:
+        result = query_workshop_item_details(
+            ("111", "222"),
+            fetcher=lambda _form_data, _timeout: b"not json",
+        )
+
+        self.assertEqual([item.workshop_id for item in result.items], ["111", "222"])
+        self.assertTrue(
+            all(
+                item.error == "Steam Workshop details response was malformed"
+                for item in result.items
+            )
+        )
+        self.assertEqual(
+            result.warnings,
+            ("Steam Workshop details response was malformed",),
+        )
+
+    def test_query_batches_large_inputs_and_restores_caller_order(self) -> None:
+        requested = tuple(str(index) for index in range(1, 52))
+        batch_sizes: list[int] = []
+
+        def fetch(form_data: bytes, _timeout: int) -> bytes:
+            form = parse_qs(form_data.decode("ascii"))
+            count = int(form["itemcount"][0])
+            batch_sizes.append(count)
+            batch_ids = [
+                form[f"publishedfileids[{index}]"][0]
+                for index in range(count)
+            ]
+            return json.dumps(
+                {
+                    "response": {
+                        "result": 1,
+                        "resultcount": count,
+                        "publishedfiledetails": [
+                            {
+                                "publishedfileid": workshop_id,
+                                "result": 1,
+                                "consumer_app_id": 108600,
+                            }
+                            for workshop_id in reversed(batch_ids)
+                        ],
+                    }
+                }
+            ).encode("utf-8")
+
+        result = query_workshop_item_details(requested, fetcher=fetch)
+
+        self.assertEqual(batch_sizes, [50, 1])
+        self.assertEqual(tuple(item.workshop_id for item in result.items), requested)
+        self.assertTrue(all(item.is_available for item in result.items))
 
 
 class LoginScriptTests(unittest.TestCase):
@@ -1092,7 +1337,9 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(snapshot_mod_info.read_bytes(), original_payload)
             self.assertEqual(snapshot_mod_info.stat().st_mtime_ns, original_payload_mtime)
 
-    def test_download_records_preferred_acf_workshop_revision_metadata(self) -> None:
+    def test_download_records_installed_acf_revision_not_newer_remote_metadata(
+        self,
+    ) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             executable = root / "steamcmd" / "steamcmd"
@@ -1156,8 +1403,8 @@ class SnapshotTests(unittest.TestCase):
                 )
 
             first, second = batch.snapshots
-            self.assertEqual(first.workshop_updated_at_utc, "2023-11-14T22:16:40+00:00")
-            self.assertEqual(first.workshop_manifest_id, "1111")
+            self.assertEqual(first.workshop_updated_at_utc, "2023-11-14T22:13:20+00:00")
+            self.assertEqual(first.workshop_manifest_id, "1110")
             self.assertEqual(second.workshop_updated_at_utc, "2023-11-14T22:15:00+00:00")
             self.assertEqual(second.workshop_manifest_id, "2220")
             first_metadata = json.loads(

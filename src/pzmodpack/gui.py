@@ -64,12 +64,15 @@ from .steamcmd import (
     StoredWorkshopSnapshot,
     SteamCmdClient,
     SteamCredentials,
+    WorkshopDetailsQueryResult,
+    WorkshopPublishedFileDetails,
     delete_all_stored_workshop_snapshots,
     delete_stored_workshop_snapshot,
     download_and_snapshot,
     install_steamcmd,
     list_stored_workshop_snapshots,
     parse_workshop_ids,
+    query_workshop_item_details,
     upload_modpack,
 )
 
@@ -77,6 +80,26 @@ from .steamcmd import (
 _MANAGED_KIND_ROLE = int(Qt.ItemDataRole.UserRole)
 _MANAGED_WORKSHOP_ID_ROLE = _MANAGED_KIND_ROLE + 1
 _MANAGED_REVISION_ROLE = _MANAGED_KIND_ROLE + 2
+_MANAGED_SORT_ROLE = _MANAGED_KIND_ROLE + 3
+_MANAGED_SEARCH_ROLE = _MANAGED_KIND_ROLE + 4
+
+
+class ManagedWorkshopTreeItem(QTreeWidgetItem):
+    """Tree item that sorts localized display values by their typed source values."""
+
+    def __lt__(self, other: QTreeWidgetItem) -> bool:
+        tree = self.treeWidget()
+        if tree is None:
+            return super().__lt__(other)
+        column = tree.sortColumn()
+        left = self.data(column, _MANAGED_SORT_ROLE)
+        right = other.data(column, _MANAGED_SORT_ROLE)
+        if left is None or right is None:
+            return super().__lt__(other)
+        try:
+            return bool(left < right)
+        except TypeError:
+            return str(left).casefold() < str(right).casefold()
 
 
 class OperationWorker(QThread):
@@ -177,6 +200,13 @@ def _stored_snapshot_sort_key(
         captured,
         record.revision_directory,
     )
+
+
+def _numeric_text_sort_value(value: str | None) -> str:
+    if not value or not value.isdigit():
+        return "0:"
+    normalized = value.lstrip("0") or "0"
+    return f"1:{len(normalized):08d}:{normalized}"
 
 
 class WorkshopSnapshotSelectionDialog(QDialog):
@@ -772,6 +802,11 @@ class ModpackWindow(QMainWindow):
         self._mod_selection_needs_review = False
         self._managed_records: dict[tuple[str, str], StoredWorkshopSnapshot] = {}
         self._manager_restore_selection: tuple[str, str | None] | None = None
+        self._managed_item_ids: tuple[str, ...] = ()
+        self._manager_remote_details: dict[str, WorkshopPublishedFileDetails] = {}
+        self._manager_remote_warnings: tuple[str, ...] = ()
+        self._manager_remote_checked_at_utc: str | None = None
+        self._manager_remote_scope: tuple[Path, Path] | None = None
         self.setWindowTitle(f"PZ Modpack Builder v{__version__}")
         self.resize(1040, 780)
         workspace = Path.home() / ".pzmodpack-builder"
@@ -1073,6 +1108,21 @@ class ModpackWindow(QMainWindow):
         self.manager_summary_label.setWordWrap(True)
         layout.addWidget(self.manager_summary_label)
 
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search"))
+        self.manager_search_edit = QLineEdit()
+        self.manager_search_edit.setClearButtonEnabled(True)
+        self.manager_search_edit.setPlaceholderText(
+            "Workshop title or ID, folder, hash, manifest, path, or status"
+        )
+        self.manager_search_edit.textChanged.connect(
+            self._filter_managed_downloads
+        )
+        search_row.addWidget(self.manager_search_edit, 1)
+        layout.addLayout(search_row)
+        self.manager_filter_count_label = QLabel("No Workshop items to show.")
+        layout.addWidget(self.manager_filter_count_label)
+
         self.manager_tree = QTreeWidget()
         self.manager_tree.setColumnCount(6)
         self.manager_tree.setHeaderLabels(
@@ -1094,6 +1144,8 @@ class ModpackWindow(QMainWindow):
                 QHeaderView.ResizeMode.ResizeToContents,
             )
         manager_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.manager_tree.setSortingEnabled(True)
+        self.manager_tree.sortItems(3, Qt.SortOrder.DescendingOrder)
         self.manager_tree.itemSelectionChanged.connect(
             self._managed_selection_changed
         )
@@ -1102,7 +1154,11 @@ class ModpackWindow(QMainWindow):
         buttons = QHBoxLayout()
         self.manager_refresh_button = QPushButton("Refresh")
         self.manager_refresh_button.clicked.connect(self.refresh_managed_downloads)
-        self.manager_update_button = QPushButton("Update selected item")
+        self.manager_check_updates_button = QPushButton("Check all for updates")
+        self.manager_check_updates_button.clicked.connect(
+            self.check_all_managed_workshop_updates
+        )
+        self.manager_update_button = QPushButton("Download latest for selected")
         self.manager_update_button.clicked.connect(
             self.update_managed_workshop_item
         )
@@ -1119,6 +1175,7 @@ class ModpackWindow(QMainWindow):
             self.delete_managed_workshop_item
         )
         buttons.addWidget(self.manager_refresh_button)
+        buttons.addWidget(self.manager_check_updates_button)
         buttons.addWidget(self.manager_update_button)
         buttons.addWidget(self.manager_add_button)
         buttons.addStretch(1)
@@ -1447,6 +1504,12 @@ class ModpackWindow(QMainWindow):
             / "108600"
         )
 
+    def _manager_check_scope(self) -> tuple[Path, Path]:
+        return (
+            Path(self.snapshot_edit.text()).expanduser().resolve(strict=False),
+            Path(self.library_edit.text()).expanduser().resolve(strict=False),
+        )
+
     def _validate_snapshot_root_separation(
         self,
         snapshot_root: Path | None = None,
@@ -1465,15 +1528,208 @@ class ModpackWindow(QMainWindow):
                 f"mutable Workshop cache ({cache})"
             )
 
-    def _manager_selection_identity(self) -> tuple[str, str | None] | None:
+    @staticmethod
+    def _managed_item_is_visible(item: QTreeWidgetItem) -> bool:
+        current: QTreeWidgetItem | None = item
+        while current is not None:
+            if current.isHidden():
+                return False
+            current = current.parent()
+        return True
+
+    def _manager_selection_identity(
+        self,
+        *,
+        visible_only: bool = True,
+    ) -> tuple[str, str | None] | None:
         item = self.manager_tree.currentItem()
-        if item is None:
+        if item is None or (
+            visible_only and not self._managed_item_is_visible(item)
+        ):
             return None
         workshop_id = str(item.data(0, _MANAGED_WORKSHOP_ID_ROLE) or "")
         if not workshop_id:
             return None
         revision = item.data(0, _MANAGED_REVISION_ROLE)
         return workshop_id, str(revision) if revision else None
+
+    @staticmethod
+    def _set_managed_item_metadata(
+        item: QTreeWidgetItem,
+        sort_values: tuple[object, ...],
+        search_values: tuple[object, ...],
+    ) -> None:
+        for column, value in enumerate(sort_values):
+            item.setData(column, _MANAGED_SORT_ROLE, value)
+        item.setData(
+            0,
+            _MANAGED_SEARCH_ROLE,
+            "\n".join(str(value) for value in search_values if value),
+        )
+
+    def _manager_remote_availability_issue(
+        self,
+        details: WorkshopPublishedFileDetails,
+    ) -> str | None:
+        if details.error:
+            return f"Workshop check failed: {details.error}"
+        if details.banned:
+            return "Workshop item is banned; update status is unknown"
+        if details.result == 9:
+            return "Workshop item is not publicly accessible; update status is unknown"
+        if details.consumer_app_id != "108600":
+            return (
+                "Workshop item did not identify Project Zomboid as its app "
+                f"({details.consumer_app_id or 'missing app ID'}); update status is "
+                "unknown"
+            )
+        if details.result != 1:
+            return (
+                f"Steam returned result {details.result!r}; update status is unknown"
+            )
+        return None
+
+    def _manager_update_assessment(
+        self,
+        workshop_id: str,
+        records: tuple[StoredWorkshopSnapshot, ...] | list[StoredWorkshopSnapshot],
+    ) -> tuple[str, str, str]:
+        details = self._manager_remote_details.get(workshop_id)
+        if details is None:
+            return "not_checked", "Not checked", "Workshop metadata has not been checked."
+        issue = self._manager_remote_availability_issue(details)
+        if issue is not None:
+            return "unknown", "Update status unknown", issue
+        if not records:
+            return (
+                "not_stored",
+                "No immutable snapshot",
+                "The item is available on Steam, but no immutable snapshot is stored.",
+            )
+        remote_manifest = details.workshop_manifest_id
+        if remote_manifest is None:
+            return (
+                "unknown",
+                "Update status unknown",
+                "Steam did not report a current content manifest.",
+            )
+        valid_records = tuple(record for record in records if record.is_valid)
+        trusted_records = tuple(
+            record
+            for record in valid_records
+            if record.workshop_manifest_id
+            and record.workshop_manifest_id.isdigit()
+            and int(record.workshop_manifest_id) > 0
+        )
+        matching_records = tuple(
+            record
+            for record in trusted_records
+            if record.workshop_manifest_id == remote_manifest
+        )
+        if matching_records:
+            newest_valid = valid_records[0] if valid_records else None
+            matching = matching_records[0]
+            if newest_valid is not None and matching is not newest_valid:
+                return (
+                    "stored_older",
+                    "Current content stored in older snapshot",
+                    f"Steam manifest {remote_manifest} matches older snapshot "
+                    f"{matching.revision_directory}.",
+                )
+            return (
+                "up_to_date",
+                "Up to date",
+                f"Steam manifest {remote_manifest} matches the latest valid snapshot.",
+            )
+        if trusted_records:
+            local_manifests = ", ".join(
+                dict.fromkeys(
+                    record.workshop_manifest_id or ""
+                    for record in trusted_records
+                )
+            )
+            return (
+                "update_available",
+                "Update available",
+                f"Steam manifest {remote_manifest} is not stored locally "
+                f"(trusted local manifests: {local_manifests}).",
+            )
+        return (
+            "unknown",
+            "Local manifest unknown",
+            "Stored snapshots do not contain a trusted Workshop manifest, so no "
+            "update decision was made from timestamps alone.",
+        )
+
+    def _manager_snapshot_remote_status(
+        self,
+        record: StoredWorkshopSnapshot,
+    ) -> str | None:
+        details = self._manager_remote_details.get(record.workshop_id)
+        if details is None or self._manager_remote_availability_issue(details):
+            return None
+        if details.workshop_manifest_id is None:
+            return "Workshop manifest unknown"
+        if not record.is_valid or not record.workshop_manifest_id:
+            return "Local manifest unknown"
+        if record.workshop_manifest_id == details.workshop_manifest_id:
+            return "Matches current Workshop content"
+        return "Different from current Workshop content"
+
+    def _managed_item_search_text(self, item: QTreeWidgetItem) -> str:
+        fields = [item.text(column) for column in range(self.manager_tree.columnCount())]
+        extra = item.data(0, _MANAGED_SEARCH_ROLE)
+        if extra:
+            fields.append(str(extra))
+        return "\n".join(fields).casefold()
+
+    def _filter_managed_downloads(self, query: str | None = None) -> None:
+        if not hasattr(self, "manager_tree"):
+            return
+        cleaned = self.manager_search_edit.text() if query is None else str(query)
+        tokens = tuple(token for token in cleaned.casefold().split() if token)
+        visible_items = 0
+        visible_snapshots = 0
+        total_items = self.manager_tree.topLevelItemCount()
+        total_snapshots = 0
+        for parent_index in range(total_items):
+            parent = self.manager_tree.topLevelItem(parent_index)
+            parent_match = not tokens or all(
+                token in self._managed_item_search_text(parent) for token in tokens
+            )
+            child_matches: list[bool] = []
+            for child_index in range(parent.childCount()):
+                child = parent.child(child_index)
+                child_match = not tokens or all(
+                    token in self._managed_item_search_text(child) for token in tokens
+                )
+                child_matches.append(child_match)
+            parent_visible = parent_match or any(child_matches)
+            parent.setHidden(not parent_visible)
+            if parent_visible:
+                visible_items += 1
+                if tokens:
+                    parent.setExpanded(True)
+            for child_index, child_match in enumerate(child_matches):
+                child = parent.child(child_index)
+                child_visible = parent_visible and (parent_match or child_match)
+                child.setHidden(not child_visible)
+                total_snapshots += 1
+                if child_visible:
+                    visible_snapshots += 1
+        if tokens:
+            self.manager_filter_count_label.setText(
+                f"Showing {visible_items} of {total_items} Workshop item(s) and "
+                f"{visible_snapshots} of {total_snapshots} snapshot(s)."
+            )
+        elif total_items:
+            self.manager_filter_count_label.setText(
+                f"Showing all {total_items} Workshop item(s) and "
+                f"{total_snapshots} snapshot(s)."
+            )
+        else:
+            self.manager_filter_count_label.setText("No Workshop items to show.")
+        self._managed_selection_changed()
 
     def _selected_managed_record(self) -> StoredWorkshopSnapshot | None:
         identity = self._manager_selection_identity()
@@ -1500,19 +1756,31 @@ class ModpackWindow(QMainWindow):
             or self._generic_operation_running
         ):
             return
+        current_scope = self._manager_check_scope()
+        if (
+            self._manager_remote_scope is not None
+            and self._manager_remote_scope != current_scope
+        ):
+            self._manager_remote_details = {}
+            self._manager_remote_warnings = ()
+            self._manager_remote_checked_at_utc = None
+            self._manager_remote_scope = None
         previous_selection = (
-            self._manager_restore_selection or self._manager_selection_identity()
+            self._manager_restore_selection
+            or self._manager_selection_identity(visible_only=False)
         )
         self._manager_restore_selection = None
         snapshot_root = Path(self.snapshot_edit.text()).expanduser()
         self.manager_root_label.setText(f"Snapshot library: {snapshot_root}")
         self.manager_tree.clear()
         self._managed_records = {}
+        self._managed_item_ids = ()
         try:
             self._validate_snapshot_root_separation(snapshot_root)
         except (OSError, ValueError) as error:
             self.manager_summary_label.setText(f"Unsafe snapshot library setting: {error}")
             self.manager_details.clear()
+            self._filter_managed_downloads()
             self._update_manager_action_buttons()
             return
         try:
@@ -1522,6 +1790,7 @@ class ModpackWindow(QMainWindow):
                 f"Could not read the snapshot library: {error}"
             )
             self.manager_details.clear()
+            self._filter_managed_downloads()
             self._update_manager_action_buttons()
             return
         inventory_warnings = list(inventory.warnings)
@@ -1549,10 +1818,19 @@ class ModpackWindow(QMainWindow):
         for workshop_id in cache_items:
             grouped.setdefault(workshop_id, [])
 
+        self._managed_item_ids = tuple(sorted(grouped, key=int))
+        manager_header = self.manager_tree.header()
+        sort_column = self.manager_tree.sortColumn()
+        sort_order = manager_header.sortIndicatorOrder()
+        self.manager_tree.setSortingEnabled(False)
         selected_item: QTreeWidgetItem | None = None
-        for workshop_id in sorted(grouped, key=int):
+        for workshop_id in self._managed_item_ids:
             records = grouped[workshop_id]
             latest = records[0] if records else None
+            remote = self._manager_remote_details.get(workshop_id)
+            _assessment_code, assessment_label, assessment_detail = (
+                self._manager_update_assessment(workshop_id, records)
+            )
             cached_path = cache_items.get(workshop_id)
             cached_mods_root = cached_path / "mods" if cached_path else None
             cached_folders: tuple[str, ...] = ()
@@ -1572,28 +1850,78 @@ class ModpackWindow(QMainWindow):
             ) or "No mod folders detected"
             attached_count = sum(self._snapshot_is_attached(record) for record in records)
             cached = cached_path is not None
-            parent_status = [f"{len(records)} snapshot(s)"]
+            parent_status = [assessment_label, f"{len(records)} snapshot(s)"]
             if attached_count:
                 parent_status.append(f"{attached_count} in current pack")
             parent_status.append("SteamCMD cache present" if cached else "Snapshot only")
-            parent = QTreeWidgetItem(
+            remote_title = remote.title if remote is not None else None
+            parent_name = (
+                f"{remote_title} (Workshop {workshop_id})"
+                if remote_title
+                else f"Workshop {workshop_id}"
+            )
+            parent_updated_at = (
+                remote.workshop_updated_at_utc
+                if remote is not None and remote.workshop_updated_at_utc
+                else latest.workshop_updated_at_utc if latest else None
+            )
+            parent_manifest = (
+                remote.workshop_manifest_id
+                if remote is not None and remote.workshop_manifest_id
+                else latest.workshop_manifest_id if latest else None
+            )
+            parent_status_text = "; ".join(parent_status)
+            parent = ManagedWorkshopTreeItem(
                 (
-                    f"Workshop {workshop_id}",
+                    parent_name,
                     mod_summary,
-                    _display_snapshot_time(
-                        latest.workshop_updated_at_utc if latest else None
-                    ),
+                    _display_snapshot_time(parent_updated_at),
                     _display_snapshot_time(
                         latest.snapshot_created_at_utc if latest else None
                     ),
-                    latest.workshop_manifest_id
-                    if latest and latest.workshop_manifest_id
-                    else "Unknown",
-                    "; ".join(parent_status),
+                    parent_manifest or "Unknown",
+                    parent_status_text,
                 )
             )
             parent.setData(0, _MANAGED_KIND_ROLE, "item")
             parent.setData(0, _MANAGED_WORKSHOP_ID_ROLE, workshop_id)
+            title_sort = (
+                f"0:{remote_title.casefold()}:{_numeric_text_sort_value(workshop_id)}"
+                if remote_title
+                else f"1:{_numeric_text_sort_value(workshop_id)}"
+            )
+            self._set_managed_item_metadata(
+                parent,
+                (
+                    title_sort,
+                    mod_summary.casefold(),
+                    _snapshot_time_value(parent_updated_at),
+                    _snapshot_time_value(
+                        latest.snapshot_created_at_utc if latest else None
+                    ),
+                    _numeric_text_sort_value(parent_manifest),
+                    parent_status_text.casefold(),
+                ),
+                (
+                    parent_name,
+                    workshop_id,
+                    mod_summary,
+                    parent_manifest,
+                    parent_status_text,
+                    assessment_detail,
+                    cached_path,
+                    remote.error if remote is not None else None,
+                ),
+            )
+            parent_tooltip = (
+                f"Workshop ID: {workshop_id}\n"
+                f"Title: {remote_title or 'Not checked or unavailable'}\n"
+                f"Remote manifest: "
+                f"{remote.workshop_manifest_id if remote else 'Not checked'}\n"
+                f"Assessment: {assessment_detail}"
+            )
+            for column in range(6):
+                parent.setToolTip(column, parent_tooltip)
             self.manager_tree.addTopLevelItem(parent)
 
             for index, record in enumerate(records):
@@ -1620,16 +1948,26 @@ class ModpackWindow(QMainWindow):
                     statuses.append("Legacy metadata")
                 elif record.metadata_state != "valid":
                     statuses.append("Metadata warning")
-                child = QTreeWidgetItem(
+                remote_status = self._manager_snapshot_remote_status(record)
+                if remote_status:
+                    statuses.append(remote_status)
+                child_status_text = "; ".join(statuses) or "Stored"
+                child_name = (
+                    record.sha256[:16]
+                    if record.sha256
+                    else record.revision_directory
+                )
+                child_folders = (
+                    ", ".join(record.mod_folders) or "No mod folders detected"
+                )
+                child = ManagedWorkshopTreeItem(
                     (
-                        record.sha256[:16]
-                        if record.sha256
-                        else record.revision_directory,
-                        ", ".join(record.mod_folders) or "No mod folders detected",
+                        child_name,
+                        child_folders,
                         _display_snapshot_time(record.workshop_updated_at_utc),
                         _display_snapshot_time(record.snapshot_created_at_utc),
                         record.workshop_manifest_id or "Unknown",
-                        "; ".join(statuses) or "Stored",
+                        child_status_text,
                     )
                 )
                 child.setData(0, _MANAGED_KIND_ROLE, "snapshot")
@@ -1639,10 +1977,35 @@ class ModpackWindow(QMainWindow):
                     _MANAGED_REVISION_ROLE,
                     record.revision_directory,
                 )
+                self._set_managed_item_metadata(
+                    child,
+                    (
+                        child_name.casefold(),
+                        child_folders.casefold(),
+                        _snapshot_time_value(record.workshop_updated_at_utc),
+                        _snapshot_time_value(record.snapshot_created_at_utc),
+                        _numeric_text_sort_value(record.workshop_manifest_id),
+                        child_status_text.casefold(),
+                    ),
+                    (
+                        child_name,
+                        workshop_id,
+                        record.sha256,
+                        record.revision_directory,
+                        record.path,
+                        child_folders,
+                        record.workshop_manifest_id,
+                        child_status_text,
+                        record.metadata_state,
+                        record.metadata_message,
+                        remote_title,
+                    ),
+                )
                 tooltip = (
                     f"Path: {record.path}\n"
                     f"Full SHA-256: {record.sha256 or 'Unavailable'}\n"
-                    f"Metadata: {record.metadata_message or record.metadata_state}"
+                    f"Metadata: {record.metadata_message or record.metadata_state}\n"
+                    f"Workshop comparison: {remote_status or 'Not checked'}"
                 )
                 for column in range(6):
                     child.setToolTip(column, tooltip)
@@ -1656,17 +2019,12 @@ class ModpackWindow(QMainWindow):
                 selected_item = parent
             parent.setExpanded(True)
 
+        self.manager_tree.setSortingEnabled(True)
+        self.manager_tree.sortItems(sort_column, sort_order)
         snapshot_count = len(inventory.snapshots)
         summary = (
             f"{len(grouped)} Workshop item(s), {snapshot_count} immutable snapshot(s)."
         )
-        if inventory_warnings:
-            summary += (
-                f" {len(inventory_warnings)} storage warning(s); hover for details."
-            )
-            self.manager_summary_label.setToolTip("\n".join(inventory_warnings))
-        else:
-            self.manager_summary_label.setToolTip("")
         if not snapshot_count:
             if grouped:
                 summary = (
@@ -1675,14 +2033,20 @@ class ModpackWindow(QMainWindow):
                 )
             else:
                 summary = f"No stored Workshop snapshots found in {snapshot_root}."
-            if inventory_warnings:
-                summary += f" {len(inventory_warnings)} storage warning(s)."
+        if inventory_warnings:
+            summary += f" {len(inventory_warnings)} storage warning(s)."
+        if self._manager_remote_warnings:
+            summary += (
+                f" {len(self._manager_remote_warnings)} Workshop check warning(s)."
+            )
+        summary_warnings = [*inventory_warnings, *self._manager_remote_warnings]
+        self.manager_summary_label.setToolTip("\n".join(summary_warnings))
         self.manager_summary_label.setText(summary)
         if selected_item is not None:
             self.manager_tree.setCurrentItem(selected_item)
         else:
             self.manager_details.clear()
-        self._managed_selection_changed()
+        self._filter_managed_downloads()
 
     def _managed_selection_changed(self) -> None:
         identity = self._manager_selection_identity()
@@ -1691,14 +2055,44 @@ class ModpackWindow(QMainWindow):
             self._update_manager_action_buttons()
             return
         workshop_id, revision = identity
+        remote = self._manager_remote_details.get(workshop_id)
+        remote_title = remote.title if remote is not None else None
+        remote_manifest = remote.workshop_manifest_id if remote is not None else None
+        remote_updated = (
+            remote.workshop_updated_at_utc if remote is not None else None
+        )
+        remote_checked_at = (
+            self._manager_remote_checked_at_utc if remote is not None else None
+        )
+        remote_metadata = (
+            f"Steam result: {remote.result!r}\n"
+            f"Consumer app ID: {remote.consumer_app_id or 'Not reported'}\n"
+            f"Visibility: {remote.visibility!r}\n"
+            f"Banned: {'Yes' if remote.banned else 'No'}\n"
+            f"Remote error: {remote.error or 'None'}\n"
+            if remote is not None
+            else "Remote metadata: Not checked\n"
+        )
         if revision is None:
             records = self._managed_records_for_item(workshop_id)
             attached = sum(self._snapshot_is_attached(record) for record in records)
+            _assessment_code, assessment_label, assessment_detail = (
+                self._manager_update_assessment(workshop_id, records)
+            )
             self.manager_details.setPlainText(
                 f"Workshop item: {workshop_id}\n"
+                f"Title: {remote_title or 'Not checked or unavailable'}\n"
+                f"Update assessment: {assessment_label}\n"
+                f"Assessment basis: {assessment_detail}\n"
+                f"Remote manifest: {remote_manifest or 'Not reported'}\n"
+                f"Remote Workshop updated: {_display_snapshot_time(remote_updated)}\n"
+                f"Metadata checked: "
+                f"{_display_snapshot_time(remote_checked_at)}\n"
+                f"{remote_metadata}"
                 f"Stored snapshots: {len(records)}\n"
                 f"Attached to current pack: {attached}\n"
-                "Update checks this item through SteamCMD and keeps every older "
+                "Check all for updates reads Workshop metadata without downloading. "
+                "Download latest for selected runs SteamCMD and keeps every older "
                 "immutable revision."
             )
         else:
@@ -1708,11 +2102,17 @@ class ModpackWindow(QMainWindow):
             else:
                 self.manager_details.setPlainText(
                     f"Workshop item: {record.workshop_id}\n"
+                    f"Title: {remote_title or 'Not checked or unavailable'}\n"
                     f"Snapshot path: {record.path}\n"
                     f"Full SHA-256: {record.sha256 or 'Unavailable'}\n"
-                    f"Workshop manifest: {record.workshop_manifest_id or 'Unknown'}\n"
+                    f"Stored manifest: {record.workshop_manifest_id or 'Unknown'}\n"
+                    f"Remote manifest: {remote_manifest or 'Not reported'}\n"
+                    f"Workshop comparison: "
+                    f"{self._manager_snapshot_remote_status(record) or 'Not checked'}\n"
                     f"Workshop updated: "
                     f"{_display_snapshot_time(record.workshop_updated_at_utc)}\n"
+                    f"Remote Workshop updated: {_display_snapshot_time(remote_updated)}\n"
+                    f"{remote_metadata}"
                     f"Snapshot captured: "
                     f"{_display_snapshot_time(record.snapshot_created_at_utc)}\n"
                     f"Metadata: {record.metadata_message or record.metadata_state}"
@@ -1736,6 +2136,9 @@ class ModpackWindow(QMainWindow):
             or self._generic_operation_running
         )
         self.manager_update_button.setEnabled(identity is not None and not busy)
+        self.manager_check_updates_button.setEnabled(
+            bool(self._managed_item_ids) and not busy
+        )
         self.manager_add_button.setEnabled(
             record is not None and record.is_valid and not busy
         )
@@ -1862,6 +2265,94 @@ class ModpackWindow(QMainWindow):
             "selection if this revision changes the available folders or Mod IDs."
         )
 
+    def _set_manager_check_running(self, running: bool, item_count: int = 0) -> None:
+        self.manager_progress.setVisible(running)
+        self.manager_operation_status.setVisible(running)
+        if running:
+            self.manager_progress.setRange(0, 0)
+            self.manager_operation_status.setText(
+                f"Checking {item_count} Workshop item(s) without downloading..."
+            )
+        else:
+            self.manager_progress.setRange(0, 100)
+            self.manager_progress.setValue(0)
+        self._set_generic_operation_running(running)
+
+    def check_all_managed_workshop_updates(self) -> None:
+        if (
+            self._build_running
+            or self._download_running
+            or self._manager_delete_running
+            or self._generic_operation_running
+        ):
+            self.log.appendPlainText(
+                "Workshop update checking is unavailable while another operation "
+                "is running."
+            )
+            return
+        workshop_ids = self._managed_item_ids
+        if not workshop_ids:
+            self.log.appendPlainText(
+                "Workshop update check skipped: no managed Workshop items are shown."
+            )
+            return
+        check_scope = self._manager_check_scope()
+        self.log.clear()
+        self.log.appendPlainText(
+            f"Checking metadata for {len(workshop_ids)} Workshop item(s). This is "
+            "read-only and does not run SteamCMD or download mod content."
+        )
+        self._set_manager_check_running(True, len(workshop_ids))
+
+        def completed(result: object) -> None:
+            self._set_manager_check_running(False)
+            if not isinstance(result, WorkshopDetailsQueryResult):
+                self.log.appendPlainText(
+                    "Workshop update check failed: unexpected metadata result."
+                )
+                return
+            self._manager_remote_details = {
+                item.workshop_id: item for item in result.items
+            }
+            self._manager_remote_warnings = tuple(result.warnings)
+            self._manager_remote_checked_at_utc = datetime.now(UTC).isoformat(
+                timespec="seconds"
+            )
+            self._manager_remote_scope = check_scope
+            self.refresh_managed_downloads()
+            assessment_codes = [
+                self._manager_update_assessment(
+                    workshop_id,
+                    self._managed_records_for_item(workshop_id),
+                )[0]
+                for workshop_id in workshop_ids
+            ]
+            current_count = sum(
+                code in {"up_to_date", "stored_older"}
+                for code in assessment_codes
+            )
+            update_count = assessment_codes.count("update_available")
+            missing_count = assessment_codes.count("not_stored")
+            unknown_count = assessment_codes.count("unknown")
+            self.log.appendPlainText(
+                f"Workshop metadata check complete: {current_count} current, "
+                f"{update_count} update(s) available, {missing_count} without an "
+                f"immutable snapshot, and {unknown_count} unknown."
+            )
+            for warning in result.warnings:
+                self.log.appendPlainText(f"Workshop check warning: {warning}")
+
+        def failed(message: str) -> None:
+            self._set_manager_check_running(False)
+            self.log.appendPlainText(f"Workshop update check failed: {message}")
+
+        self._execute(
+            lambda: query_workshop_item_details(workshop_ids),
+            completed,
+            "Workshop update check failed",
+            on_failure=failed,
+        )
+
     def update_managed_workshop_item(self) -> None:
         identity = self._manager_selection_identity()
         if identity is None:
@@ -1877,7 +2368,8 @@ class ModpackWindow(QMainWindow):
         }
         self.log.clear()
         self.log.appendPlainText(
-            f"Checking Workshop {workshop_id} for an updated snapshot..."
+            f"Downloading the latest content for Workshop {workshop_id} through "
+            "SteamCMD..."
         )
         self._start_workshop_download(
             (workshop_id,),
@@ -2515,6 +3007,18 @@ class ModpackWindow(QMainWindow):
                 self.refresh_managed_downloads()
                 return
             for snapshot in batch.snapshots:
+                checked_remote = self._manager_remote_details.get(
+                    snapshot.workshop_id
+                )
+                if checked_remote is not None and (
+                    not snapshot.workshop_manifest_id
+                    or checked_remote.workshop_manifest_id
+                    != snapshot.workshop_manifest_id
+                ):
+                    # SteamCMD may have downloaded a newer revision than the
+                    # earlier public metadata response.  Do not compare the
+                    # fresh snapshot against stale remote state.
+                    self._manager_remote_details.pop(snapshot.workshop_id, None)
                 previous_revisions = previous_records.get(snapshot.workshop_id, ())
                 previous_latest = (
                     previous_revisions[0].sha256

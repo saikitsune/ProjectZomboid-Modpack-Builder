@@ -6,4 +6,4 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("pz-modpack-builder")
 except PackageNotFoundError:
-    __version__ = "0.7.0-dev"
+    __version__ = "0.8.0-dev"

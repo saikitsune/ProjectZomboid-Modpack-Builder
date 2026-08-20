@@ -19,8 +19,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from .version import __version__
 
@@ -29,7 +30,13 @@ STEAMCMD_WINDOWS_URL = "https://client-update.steamstatic.com/installer/steamcmd
 STEAMCMD_LINUX_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
 PROJECT_GITHUB_URL = "https://github.com/saikitsune/ProjectZomboid-Modpack-Builder"
 WORKSHOP_ITEM_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id={}"
+WORKSHOP_DETAILS_URL = (
+    "https://api.steampowered.com/"
+    "ISteamRemoteStorage/GetPublishedFileDetails/v1/"
+)
 WORKSHOP_DESCRIPTION_MAX_BYTES = 8000
+WORKSHOP_DETAILS_BATCH_SIZE = 50
+WORKSHOP_DETAILS_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _SNAPSHOT_STORE_LOCK = threading.RLock()
 
 
@@ -46,6 +53,34 @@ class SteamCredentials:
     @property
     def is_anonymous(self) -> bool:
         return not self.username
+
+
+@dataclass(frozen=True)
+class WorkshopPublishedFileDetails:
+    workshop_id: str
+    result: int | None
+    title: str | None = None
+    workshop_updated_at_utc: str | None = None
+    workshop_manifest_id: str | None = None
+    consumer_app_id: str | None = None
+    banned: bool = False
+    visibility: int | None = None
+    error: str | None = None
+
+    @property
+    def is_available(self) -> bool:
+        return (
+            self.error is None
+            and self.result == 1
+            and not self.banned
+            and self.consumer_app_id == PZ_APP_ID
+        )
+
+
+@dataclass(frozen=True)
+class WorkshopDetailsQueryResult:
+    items: tuple[WorkshopPublishedFileDetails, ...]
+    warnings: tuple[str, ...] = ()
 
 
 def parse_workshop_ids(values: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -846,6 +881,223 @@ def _unix_timestamp_utc(value: str | None) -> str | None:
         return None
 
 
+def _fetch_workshop_details_response(form_data: bytes, timeout: int) -> bytes:
+    request = Request(
+        WORKSHOP_DETAILS_URL,
+        data=form_data,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": f"PZ-Modpack-Builder/{__version__}",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = response.read(WORKSHOP_DETAILS_MAX_RESPONSE_BYTES + 1)
+    if len(payload) > WORKSHOP_DETAILS_MAX_RESPONSE_BYTES:
+        raise ValueError("Steam Workshop details response exceeded the safety limit")
+    return payload
+
+
+def _workshop_query_error(error: BaseException) -> str:
+    if isinstance(error, HTTPError):
+        return f"Steam Web API returned HTTP {error.code}"
+    if isinstance(error, URLError):
+        return f"Could not contact Steam Web API: {error.reason}"
+    return str(error) or error.__class__.__name__
+
+
+def _workshop_query_is_transient(error: BaseException) -> bool:
+    if isinstance(error, HTTPError):
+        return error.code in {429, 500, 502, 503, 504}
+    return isinstance(error, (OSError, URLError))
+
+
+def _workshop_retry_delay(error: BaseException, attempt: int) -> float:
+    if isinstance(error, HTTPError) and error.headers is not None:
+        retry_after = error.headers.get("Retry-After")
+        try:
+            return min(max(float(retry_after), 0.0), 5.0)
+        except (TypeError, ValueError):
+            pass
+    return min(0.25 * (2**attempt), 1.0)
+
+
+def _optional_integer(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_positive_string(value: object) -> str | None:
+    parsed = _optional_integer(value)
+    return str(parsed) if parsed is not None and parsed > 0 else None
+
+
+def _published_file_details(
+    workshop_id: str,
+    payload: dict[str, object],
+) -> WorkshopPublishedFileDetails:
+    result = _optional_integer(payload.get("result"))
+    title = str(payload.get("title") or "").strip() or None
+    updated_at_utc = _unix_timestamp_utc(
+        _optional_positive_string(payload.get("time_updated"))
+    )
+    manifest_id = _optional_positive_string(payload.get("hcontent_file"))
+    consumer_app_id = _optional_positive_string(payload.get("consumer_app_id"))
+    visibility = _optional_integer(payload.get("visibility"))
+    banned_value = payload.get("banned")
+    banned = (
+        banned_value is True
+        or _optional_integer(banned_value) == 1
+        or str(banned_value).strip().casefold() == "true"
+    )
+    error = None if result is not None else "Steam response omitted the item result code"
+    return WorkshopPublishedFileDetails(
+        workshop_id=workshop_id,
+        result=result,
+        title=title,
+        workshop_updated_at_utc=updated_at_utc,
+        workshop_manifest_id=manifest_id,
+        consumer_app_id=consumer_app_id,
+        banned=banned,
+        visibility=visibility,
+        error=error,
+    )
+
+
+def _parse_workshop_details_batch(
+    payload: bytes,
+    requested_ids: tuple[str, ...],
+) -> tuple[tuple[WorkshopPublishedFileDetails, ...], tuple[str, ...]]:
+    try:
+        loaded = json.loads(payload.decode("utf-8-sig"))
+        if not isinstance(loaded, dict):
+            raise TypeError
+        response = loaded["response"]
+        if not isinstance(response, dict):
+            raise TypeError
+        raw_details = response["publishedfiledetails"]
+    except (KeyError, TypeError, UnicodeError, ValueError) as error:
+        raise ValueError("Steam Workshop details response was malformed") from error
+    if _optional_integer(response.get("result")) != 1 or not isinstance(
+        raw_details,
+        list,
+    ):
+        raise ValueError("Steam Workshop details response was malformed")
+
+    requested = set(requested_ids)
+    by_id: dict[str, dict[str, object]] = {}
+    duplicates: set[str] = set()
+    warnings: list[str] = []
+    for candidate in raw_details:
+        if not isinstance(candidate, dict):
+            warnings.append("Steam returned a non-object Workshop detail entry")
+            continue
+        workshop_id = str(candidate.get("publishedfileid") or "").strip()
+        if workshop_id not in requested:
+            warnings.append(
+                f"Steam returned unrequested Workshop item {workshop_id or '<missing ID>'}"
+            )
+            continue
+        if workshop_id in by_id:
+            duplicates.add(workshop_id)
+            continue
+        by_id[workshop_id] = candidate
+
+    items: list[WorkshopPublishedFileDetails] = []
+    for workshop_id in requested_ids:
+        if workshop_id in duplicates:
+            message = f"Steam returned duplicate details for Workshop {workshop_id}"
+            warnings.append(message)
+            items.append(WorkshopPublishedFileDetails(workshop_id, None, error=message))
+            continue
+        candidate = by_id.get(workshop_id)
+        if candidate is None:
+            message = f"Steam returned no details for Workshop {workshop_id}"
+            warnings.append(message)
+            items.append(WorkshopPublishedFileDetails(workshop_id, None, error=message))
+            continue
+        items.append(_published_file_details(workshop_id, candidate))
+    return tuple(items), tuple(warnings)
+
+
+def query_workshop_item_details(
+    workshop_ids: tuple[str, ...] | list[str],
+    *,
+    timeout: int = 20,
+    fetcher: Callable[[bytes, int], bytes] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+) -> WorkshopDetailsQueryResult:
+    """Read public Workshop metadata without invoking SteamCMD or changing files."""
+    unique_ids: list[str] = []
+    for workshop_id in workshop_ids:
+        cleaned = str(workshop_id).strip()
+        if not cleaned.isdigit() or int(cleaned) <= 0:
+            raise ValueError(f"Invalid Workshop ID: {workshop_id}")
+        if cleaned not in unique_ids:
+            unique_ids.append(cleaned)
+    if timeout <= 0:
+        raise ValueError("Workshop update-check timeout must be positive")
+    if not unique_ids:
+        return WorkshopDetailsQueryResult(())
+
+    fetch = fetcher or _fetch_workshop_details_response
+    wait = sleeper or time.sleep
+    items: list[WorkshopPublishedFileDetails] = []
+    warnings: list[str] = []
+    for offset in range(0, len(unique_ids), WORKSHOP_DETAILS_BATCH_SIZE):
+        batch = tuple(unique_ids[offset : offset + WORKSHOP_DETAILS_BATCH_SIZE])
+        form_fields: list[tuple[str, str]] = [("itemcount", str(len(batch)))]
+        form_fields.extend(
+            (f"publishedfileids[{index}]", workshop_id)
+            for index, workshop_id in enumerate(batch)
+        )
+        form_fields.append(("format", "json"))
+        form_data = urlencode(form_fields).encode("ascii")
+        payload: bytes | None = None
+        final_error: BaseException | None = None
+        for attempt in range(3):
+            try:
+                payload = fetch(form_data, timeout)
+                final_error = None
+                break
+            except (HTTPError, URLError, OSError, ValueError) as error:
+                final_error = error
+                if attempt >= 2 or not _workshop_query_is_transient(error):
+                    break
+                wait(_workshop_retry_delay(error, attempt))
+        if payload is None:
+            message = _workshop_query_error(
+                final_error or RuntimeError("Steam Workshop check failed")
+            )
+            warnings.append(message)
+            items.extend(
+                WorkshopPublishedFileDetails(workshop_id, None, error=message)
+                for workshop_id in batch
+            )
+            continue
+        try:
+            batch_items, batch_warnings = _parse_workshop_details_batch(payload, batch)
+        except ValueError as error:
+            message = str(error)
+            warnings.append(message)
+            items.extend(
+                WorkshopPublishedFileDetails(workshop_id, None, error=message)
+                for workshop_id in batch
+            )
+            continue
+        items.extend(batch_items)
+        warnings.extend(batch_warnings)
+    return WorkshopDetailsQueryResult(
+        tuple(items),
+        tuple(dict.fromkeys(warnings)),
+    )
+
+
 def _read_workshop_item_metadata(
     library_root: Path,
     workshop_ids: tuple[str, ...],
@@ -868,12 +1120,16 @@ def _read_workshop_item_metadata(
     for workshop_id in workshop_ids:
         installed = _casefolded_value(installed_items, workshop_id)
         details = _casefolded_value(item_details, workshop_id)
-        updated_timestamp = _positive_numeric_value(details, "latest_timeupdated")
+        # The immutable snapshot is copied from SteamCMD's installed cache, so
+        # provenance must describe the installed bytes.  ``latest_*`` can point
+        # at a newer remote revision Steam knows about before that revision has
+        # actually replaced the cache contents.
+        updated_timestamp = _positive_numeric_value(installed, "timeupdated")
         if updated_timestamp is None:
-            updated_timestamp = _positive_numeric_value(installed, "timeupdated")
-        manifest_id = _positive_numeric_value(details, "latest_manifest")
+            updated_timestamp = _positive_numeric_value(details, "timeupdated")
+        manifest_id = _positive_numeric_value(installed, "manifest")
         if manifest_id is None:
-            manifest_id = _positive_numeric_value(installed, "manifest")
+            manifest_id = _positive_numeric_value(details, "manifest")
         updated_at_utc = _unix_timestamp_utc(updated_timestamp)
         if updated_at_utc is not None or manifest_id is not None:
             result[workshop_id] = _WorkshopItemMetadata(

@@ -36,8 +36,9 @@ CraftableMilitaryFences -> SaiPack_CraftableMilitaryFences
 - Workshop snapshot revision grouping with one active revision per Workshop item
 - Latest-revision defaults with explicit older-snapshot rollback selection
 - Snapshot capture, Workshop update, and Workshop manifest provenance
-- Dedicated Workshop download manager with grouped snapshot history
-- Per-item update, explicit revision attachment, and confirmed snapshot cleanup
+- Dedicated Workshop download manager with grouped snapshot history, sortable columns, and live search
+- Keyless, metadata-only checks for newer content on the public Steam Workshop
+- Per-item latest download, explicit revision attachment, and confirmed snapshot cleanup
 - Storage-level snapshot integrity checks and path-contained deletion
 - Multiple `mod.info` variants, including root, `42`, and `42.20`
 - Stable Mod ID namespacing
@@ -94,7 +95,7 @@ Valve's Linux SteamCMD bootstrap starts a 32-bit binary. A 64-bit Linux installa
 3. Choose anonymous login or enter a Steam account and optional Guard code.
 4. Paste Workshop URLs or IDs, one per line.
 5. Click **Download, snapshot, and add to pack**.
-6. Optionally open **Manage downloads** to inspect every stored Workshop item and revision, update one item, attach a particular revision, or delete snapshots after confirmation.
+6. Optionally open **Manage downloads** to search or sort every stored Workshop item and revision, run **Check all for updates**, use **Download latest for selected**, attach a particular revision, or delete snapshots after confirmation.
 7. Open **Build pack** and scan the resulting sources. Historical snapshots are grouped by Workshop item instead of scanned as duplicate mods.
 8. Click **Select snapshots and bundled mods...**. Choose one snapshot revision per Workshop item, then choose the bundled folders from those revisions.
 9. Enter a stable namespace, select the active B41/B42 IDs, choose a preview, set visibility, and choose the version bump for rebuilds.
@@ -114,7 +115,7 @@ At upload time, the builder appends a Steam BBCode footer to the user-entered de
 
 The program never automatically replaces or deletes a locked snapshot when an upstream item changes. Downloading or updating again creates or reuses a snapshot based on the content hash. The **Manage downloads** tab is the only place that permanently deletes stored revisions, and every deletion requires confirmation. It removes builder snapshots only—not SteamCMD's mutable cache—and synchronizes the current in-memory project when an attached revision is removed. Other saved project files are not rewritten automatically. Builds follow the latest downloaded revision by default while keeping every older revision selectable. If an older revision was explicitly selected, new downloads preserve that pin until it is changed in the snapshot selector.
 
-After SteamCMD downloads an item, the builder reads Steam's local `appworkshop_108600.acf` manifest and records the Workshop update time and manifest ID in `snapshot.json` alongside the local UTC capture time. Missing or malformed Steam metadata never blocks a download. Existing format-1 snapshots are upgraded safely when the same content is downloaded again; only their metadata changes, never the frozen mod payload.
+After SteamCMD downloads an item, the builder reads the installed entry in Steam's local `appworkshop_108600.acf` manifest and records the Workshop update time and manifest ID in `snapshot.json` alongside the local UTC capture time. Installed provenance is preferred over Steam's potentially newer `latest_*` fields so the recorded manifest always describes the bytes that were actually snapshotted. Missing or malformed Steam metadata never blocks a download. Existing format-1 snapshots are upgraded safely when the same content is downloaded again; only their metadata changes, never the frozen mod payload.
 
 ### Modpack version history
 
@@ -126,7 +127,11 @@ Every versioned manifest records the pack version, previous version, builder ver
 
 During a batch download, the Workshop tab shows the current item, SteamCMD's item percentage when available, completed-item count, and immutable-snapshot progress. The overall bar reserves its final stage for hashing and snapshotting the downloaded files.
 
-The download manager inventories the snapshot store directly, so an empty or malformed revision remains visible with a warning instead of disappearing from mod discovery. It also shows cache-only Workshop items so they can be updated into immutable snapshots. “Latest stored” means the newest revision already in the local library; it is not a claim that Steam currently has no newer version. Updating a selected item performs that SteamCMD check and shows progress in the manager tab. Snapshot deletion and Workshop updates are disabled while a build or another snapshot mutation is using the same files. The snapshot library and SteamCMD cache must be separate directory trees; both the GUI and storage layer refuse overlapping paths to prevent cache content from ever being mistaken for deletable snapshots.
+The download manager inventories the snapshot store directly, so an empty or malformed revision remains visible with a warning instead of disappearing from mod discovery. It also shows cache-only Workshop items so they can be downloaded into immutable snapshots. Every displayed column can be sorted by clicking its header, including Workshop item/snapshot, bundled folders, Workshop update time, snapshot capture time, manifest, and status. The live search box filters item parents and individual revisions using Workshop IDs and titles, folder names, hashes, paths, manifests, metadata, and status text.
+
+**Check all for updates** sends batched metadata-only requests to Valve's public, keyless `GetPublishedFileDetails` Web API. It does not invoke SteamCMD, download mod content, alter the mutable cache, or change immutable snapshots. **Up to date** means the remote content manifest matches the latest valid local snapshot. **Current content stored in older snapshot** means it matches another revision in local history, such as after an upstream rollback. **Update available** means Steam reported a different content manifest from every trustworthy manifest in the local snapshot history. Workshop timestamps are shown for context but never override the manifest comparison. Legacy or malformed snapshots without a trustworthy manifest, inaccessible/private items, and incomplete Steam responses remain explicitly unknown rather than being guessed current or outdated.
+
+**Latest stored** means the newest revision already in the local library; it is not a claim that Steam currently has no newer version. **Download latest for selected** is the separate action that runs SteamCMD, shows download and snapshot progress in the manager tab, and creates or reuses an immutable snapshot without replacing older revisions. Snapshot deletion and Workshop downloads are disabled while a build or another snapshot mutation is using the same files. The snapshot library and SteamCMD cache must be separate directory trees; both the GUI and storage layer refuse overlapping paths to prevent cache content from ever being mistaken for deletable snapshots.
 
 ## Steam login security
 

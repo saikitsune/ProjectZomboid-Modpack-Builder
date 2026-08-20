@@ -11,7 +11,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialogButtonBox,
+    QLineEdit,
+    QMessageBox,
+    QTreeWidgetItem,
+)
 
 from pzmodpack.backend import BuildReport, discover_mods
 from pzmodpack.gui import (
@@ -23,9 +29,15 @@ from pzmodpack.project import load_project
 from pzmodpack.steamcmd import (
     DownloadBatchResult,
     SteamCmdResult,
+    WorkshopDetailsQueryResult,
+    WorkshopPublishedFileDetails,
     WorkshopSnapshot,
     WorkshopUploadResult,
 )
+
+
+_MANAGER_WORKSHOP_ID_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+_MANAGER_REVISION_ROLE = _MANAGER_WORKSHOP_ID_ROLE + 1
 
 
 def _stored_snapshot_fixture(
@@ -36,6 +48,7 @@ def _stored_snapshot_fixture(
     *,
     folder: str = "Example",
     updated_at: str | None = None,
+    manifest_id: str | None = None,
 ) -> Path:
     snapshot = snapshot_root / workshop_id / sha256[:16]
     mod = snapshot / "mods" / folder / "42"
@@ -52,11 +65,36 @@ def _stored_snapshot_fixture(
     }
     if updated_at is not None:
         metadata["workshop_updated_at_utc"] = updated_at
+    if manifest_id is not None:
+        metadata["workshop_manifest_id"] = manifest_id
     (snapshot / "snapshot.json").write_text(
         json.dumps(metadata),
         encoding="utf-8",
     )
     return snapshot
+
+
+def _managed_parent(window: ModpackWindow, workshop_id: str) -> QTreeWidgetItem:
+    for index in range(window.manager_tree.topLevelItemCount()):
+        item = window.manager_tree.topLevelItem(index)
+        if str(item.data(0, _MANAGER_WORKSHOP_ID_ROLE) or "") == workshop_id:
+            return item
+    raise AssertionError(f"Workshop {workshop_id} is not shown in the manager")
+
+
+def _managed_snapshot(
+    window: ModpackWindow,
+    workshop_id: str,
+    revision: str,
+) -> QTreeWidgetItem:
+    parent = _managed_parent(window, workshop_id)
+    for index in range(parent.childCount()):
+        item = parent.child(index)
+        if str(item.data(0, _MANAGER_REVISION_ROLE) or "") == revision:
+            return item
+    raise AssertionError(
+        f"Workshop {workshop_id} snapshot {revision} is not shown in the manager"
+    )
 
 
 class GuiTests(unittest.TestCase):
@@ -70,10 +108,12 @@ class GuiTests(unittest.TestCase):
             source = root / "source"
             mod = source / "mods" / "Example"
             mod.mkdir(parents=True)
-            (mod / "mod.info").write_text("name=Example\nid=ExampleId\n", encoding="utf-8")
+            (mod / "mod.info").write_text(
+                "name=Example\nid=ExampleId\n", encoding="utf-8"
+            )
             destination = root / "built"
             window = ModpackWindow(run_async=False, persist_session=False)
-            self.assertIn("v0.7.0", window.windowTitle())
+            self.assertIn("v0.8.0", window.windowTitle())
             window.name_edit.setText("GUI Pack")
             window.namespace_edit.setText("GuiPack")
             window.workshop_edit.setText("123")
@@ -502,7 +542,7 @@ class GuiTests(unittest.TestCase):
             window.test_steam_login()
         log = window.log.toPlainText()
         self.assertIn("Steam login succeeded", log)
-        self.assertIn("PZ Modpack Builder v0.7.0", log)
+        self.assertIn("PZ Modpack Builder v0.8.0", log)
         self.assertNotIn("super-secret", log)
         self.assertNotIn("ABCDE", log)
         self.assertEqual(window.password_edit.text(), "")
@@ -527,7 +567,9 @@ class GuiTests(unittest.TestCase):
             self.assertFalse(restored.anonymous_check.isChecked())
             self.assertEqual(restored.username_edit.text(), "sai")
             self.assertEqual(restored.password_edit.text(), "")
-            self.assertIn("Cached SteamCMD account: sai", restored.login_status_label.text())
+            self.assertIn(
+                "Cached SteamCMD account: sai", restored.login_status_label.text()
+            )
             self.assertNotIn("secret", serialized)
             self.assertNotIn("password", serialized.lower())
             restored.close()
@@ -545,7 +587,9 @@ class GuiTests(unittest.TestCase):
                 snapshots=(WorkshopSnapshot("111", "abcdef", snapshot_path),),
             )
 
-            with patch("pzmodpack.gui.download_and_snapshot", return_value=batch) as download:
+            with patch(
+                "pzmodpack.gui.download_and_snapshot", return_value=batch
+            ) as download:
                 window.download_workshop_items()
 
             self.assertEqual(window.source_paths(), (snapshot_path.resolve(),))
@@ -670,7 +714,9 @@ class GuiTests(unittest.TestCase):
                 release.wait(timeout=3)
                 return batch
 
-            with patch("pzmodpack.gui.download_and_snapshot", side_effect=slow_download):
+            with patch(
+                "pzmodpack.gui.download_and_snapshot", side_effect=slow_download
+            ):
                 window.download_workshop_items()
                 deadline = time.monotonic() + 2
                 while not started.is_set() and time.monotonic() < deadline:
@@ -742,7 +788,318 @@ class GuiTests(unittest.TestCase):
             self.assertIn(old_hash, window.manager_details.toPlainText())
             window.close()
 
-    def test_manager_update_of_global_item_does_not_add_it_to_current_pack(self) -> None:
+    def test_manager_header_sorting_uses_numeric_and_chronological_values(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            old_hash = "a" * 64
+            latest_hash = "b" * 64
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "9",
+                old_hash,
+                "2026-08-20T00:05:00+00:00",
+                updated_at="2026-08-20T00:05:00+00:00",
+                manifest_id="9",
+            )
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "9",
+                latest_hash,
+                "2026-08-20T23:55:00+00:00",
+                updated_at="2026-08-20T23:55:00+00:00",
+                manifest_id="100",
+            )
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "100",
+                "c" * 64,
+                "2026-08-20T12:00:00+00:00",
+                updated_at="2026-08-20T12:00:00+00:00",
+                manifest_id="9",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.refresh_managed_downloads()
+
+            window.manager_tree.sortItems(0, Qt.SortOrder.AscendingOrder)
+            self.assertEqual(
+                [
+                    str(
+                        window.manager_tree.topLevelItem(index).data(
+                            0,
+                            _MANAGER_WORKSHOP_ID_ROLE,
+                        )
+                    )
+                    for index in range(window.manager_tree.topLevelItemCount())
+                ],
+                ["9", "100"],
+            )
+
+            window.manager_tree.sortItems(4, Qt.SortOrder.AscendingOrder)
+            self.assertEqual(
+                str(
+                    window.manager_tree.topLevelItem(0).data(
+                        0,
+                        _MANAGER_WORKSHOP_ID_ROLE,
+                    )
+                ),
+                "100",
+            )
+            parent = _managed_parent(window, "9")
+            self.assertEqual(
+                [parent.child(index).text(4) for index in range(parent.childCount())],
+                ["9", "100"],
+            )
+            self.assertIn(
+                "Latest stored",
+                _managed_snapshot(window, "9", latest_hash[:16]).text(5),
+            )
+
+            for date_column in (2, 3):
+                window.manager_tree.sortItems(
+                    date_column,
+                    Qt.SortOrder.AscendingOrder,
+                )
+                parent = _managed_parent(window, "9")
+                self.assertEqual(
+                    [
+                        str(parent.child(index).data(0, _MANAGER_REVISION_ROLE))
+                        for index in range(parent.childCount())
+                    ],
+                    [old_hash[:16], latest_hash[:16]],
+                )
+                self.assertIn(
+                    "Latest stored",
+                    _managed_snapshot(window, "9", latest_hash[:16]).text(5),
+                )
+            window.close()
+
+    def test_manager_search_filters_hierarchy_and_disables_hidden_selection(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            old_hash = "a" * 64
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                old_hash,
+                "2026-08-18T12:00:00+00:00",
+                folder="Ancient Alpha",
+                manifest_id="101",
+            )
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                "b" * 64,
+                "2026-08-19T12:00:00+00:00",
+                folder="Current Beta",
+                manifest_id="102",
+            )
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "222",
+                "c" * 64,
+                "2026-08-19T12:00:00+00:00",
+                folder="Unrelated Gamma",
+                manifest_id="201",
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.refresh_managed_downloads()
+            old = _managed_snapshot(window, "111", old_hash[:16])
+            window.manager_tree.setCurrentItem(old)
+            self.assertTrue(window.manager_add_button.isEnabled())
+
+            window.manager_search_edit.setText(f"111 ANCIENT {old_hash}")
+            parent_111 = _managed_parent(window, "111")
+            self.assertFalse(parent_111.isHidden())
+            self.assertFalse(old.isHidden())
+            self.assertTrue(
+                _managed_snapshot(window, "111", ("b" * 64)[:16]).isHidden()
+            )
+            self.assertTrue(_managed_parent(window, "222").isHidden())
+            self.assertIn("1 of 2 Workshop", window.manager_filter_count_label.text())
+
+            window.manager_search_edit.setText("WORKSHOP 111")
+            self.assertTrue(
+                all(
+                    not parent_111.child(index).isHidden()
+                    for index in range(parent_111.childCount())
+                )
+            )
+
+            window.manager_search_edit.setText("222 unrelated")
+            self.assertTrue(parent_111.isHidden())
+            self.assertFalse(_managed_parent(window, "222").isHidden())
+            self.assertFalse(window.manager_update_button.isEnabled())
+            self.assertFalse(window.manager_add_button.isEnabled())
+            self.assertFalse(window.manager_delete_snapshot_button.isEnabled())
+            self.assertFalse(window.manager_delete_item_button.isEnabled())
+            self.assertEqual(window.manager_details.toPlainText(), "")
+
+            window.manager_search_edit.clear()
+            self.assertFalse(parent_111.isHidden())
+            self.assertFalse(old.isHidden())
+            self.assertFalse(_managed_parent(window, "222").isHidden())
+            self.assertTrue(window.manager_update_button.isEnabled())
+            self.assertTrue(window.manager_add_button.isEnabled())
+            self.assertTrue(window.manager_delete_snapshot_button.isEnabled())
+            self.assertTrue(window.manager_delete_item_button.isEnabled())
+            window.close()
+
+    def test_manager_check_all_assesses_manifests_and_shows_remote_details(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                "a" * 64,
+                "2026-08-19T12:00:00+00:00",
+                manifest_id="100",
+            )
+            older_222 = _stored_snapshot_fixture(
+                snapshot_root,
+                "222",
+                "b" * 64,
+                "2026-08-18T12:00:00+00:00",
+                manifest_id="400",
+            )
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "222",
+                "c" * 64,
+                "2026-08-19T12:00:00+00:00",
+                manifest_id="300",
+            )
+            current_333 = _stored_snapshot_fixture(
+                snapshot_root,
+                "333",
+                "d" * 64,
+                "2026-08-19T12:00:00+00:00",
+                manifest_id="500",
+            )
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "555",
+                "e" * 64,
+                "2026-08-19T12:00:00+00:00",
+                manifest_id="700",
+            )
+            library = root / "steam-library"
+            (library / "steamapps" / "workshop" / "content" / "108600" / "444").mkdir(
+                parents=True
+            )
+            details = WorkshopDetailsQueryResult(
+                (
+                    WorkshopPublishedFileDetails(
+                        "333",
+                        1,
+                        title="Current Content",
+                        workshop_updated_at_utc="2026-08-20T11:00:00+00:00",
+                        workshop_manifest_id="500",
+                        consumer_app_id="108600",
+                    ),
+                    WorkshopPublishedFileDetails(
+                        "111",
+                        1,
+                        title="Needs Update",
+                        workshop_updated_at_utc="2026-08-20T12:00:00+00:00",
+                        workshop_manifest_id="200",
+                        consumer_app_id="108600",
+                    ),
+                    WorkshopPublishedFileDetails(
+                        "555",
+                        9,
+                        title="Private Item",
+                    ),
+                    WorkshopPublishedFileDetails(
+                        "444",
+                        1,
+                        title="Cache Only",
+                        workshop_manifest_id="600",
+                        consumer_app_id="108600",
+                    ),
+                    WorkshopPublishedFileDetails(
+                        "222",
+                        1,
+                        title="Older Content Is Current",
+                        workshop_manifest_id="400",
+                        consumer_app_id="108600",
+                    ),
+                )
+            )
+            window = ModpackWindow(run_async=False, persist_session=False)
+            window.library_edit.setText(str(library))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.snapshot_selections = {"333": "d" * 64}
+            window.refresh_managed_downloads()
+            original_sources = window.source_paths()
+
+            with (
+                patch(
+                    "pzmodpack.gui.query_workshop_item_details",
+                    return_value=details,
+                ) as query,
+                patch("pzmodpack.gui.download_and_snapshot") as download,
+            ):
+                window.check_all_managed_workshop_updates()
+
+            query.assert_called_once_with(("111", "222", "333", "444", "555"))
+            download.assert_not_called()
+            self.assertEqual(window.source_paths(), original_sources)
+            self.assertEqual(window.snapshot_selections, {"333": "d" * 64})
+            self.assertIn("Update available", _managed_parent(window, "111").text(5))
+            self.assertIn(
+                "Current content stored in older snapshot",
+                _managed_parent(window, "222").text(5),
+            )
+            self.assertIn("Up to date", _managed_parent(window, "333").text(5))
+            self.assertIn(
+                "No immutable snapshot",
+                _managed_parent(window, "444").text(5),
+            )
+            self.assertIn(
+                "Update status unknown",
+                _managed_parent(window, "555").text(5),
+            )
+            window.manager_tree.setCurrentItem(_managed_parent(window, "555"))
+            self.assertIn(
+                "not publicly accessible",
+                window.manager_details.toPlainText(),
+            )
+            self.assertIn(
+                "Matches current Workshop content",
+                _managed_snapshot(window, "222", older_222.name).text(5),
+            )
+            self.assertIn(
+                "Matches current Workshop content",
+                _managed_snapshot(window, "333", current_333.name).text(5),
+            )
+            parent_111 = _managed_parent(window, "111")
+            self.assertIn("Needs Update", parent_111.text(0))
+            window.manager_tree.setCurrentItem(parent_111)
+            manager_details = window.manager_details.toPlainText()
+            self.assertIn("Title: Needs Update", manager_details)
+            self.assertIn("Remote manifest: 200", manager_details)
+            self.assertIn("Update assessment: Update available", manager_details)
+            self.assertIn(
+                "2 current, 1 update(s) available, 1 without an immutable snapshot, "
+                "and 1 unknown",
+                window.log.toPlainText(),
+            )
+            window.close()
+
+    def test_manager_update_of_global_item_does_not_add_it_to_current_pack(
+        self,
+    ) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             snapshot_root = root / "snapshots"
@@ -800,12 +1157,14 @@ class GuiTests(unittest.TestCase):
                 "111",
                 old_hash,
                 "2026-08-18T12:05:00+00:00",
+                manifest_id="100",
             )
             new = _stored_snapshot_fixture(
                 snapshot_root,
                 "111",
                 new_hash,
                 "2026-08-19T12:05:00+00:00",
+                manifest_id="200",
             )
             batch = DownloadBatchResult(
                 SteamCmdResult(True, 0, "Downloaded"),
@@ -815,6 +1174,7 @@ class GuiTests(unittest.TestCase):
                         new_hash,
                         new,
                         "2026-08-19T12:05:00+00:00",
+                        workshop_manifest_id="200",
                         created=True,
                     ),
                 ),
@@ -827,6 +1187,14 @@ class GuiTests(unittest.TestCase):
             window.included_mod_ids = ("ExampleId",)
             window.refresh_managed_downloads()
             window.manager_tree.setCurrentItem(window.manager_tree.topLevelItem(0))
+            window._manager_remote_details = {
+                "111": WorkshopPublishedFileDetails(
+                    "111",
+                    1,
+                    workshop_manifest_id="150",
+                    consumer_app_id="108600",
+                )
+            }
 
             with patch(
                 "pzmodpack.gui.download_and_snapshot",
@@ -838,6 +1206,7 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(window.snapshot_selections, {"111": new_hash})
             self.assertEqual(window.included_mod_ids, ("ExampleId",))
             self.assertTrue(window._mod_selection_needs_review)
+            self.assertIn("Not checked", _managed_parent(window, "111").text(5))
             window.close()
 
     def test_manager_lists_cache_only_item_as_updateable(self) -> None:
@@ -867,10 +1236,110 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(parent.childCount(), 0)
             self.assertIn("Cached Example", parent.text(1))
             self.assertIn("SteamCMD cache present", parent.text(5))
-            self.assertIn("1 SteamCMD cache item(s)", window.manager_summary_label.text())
+            self.assertIn(
+                "1 SteamCMD cache item(s)", window.manager_summary_label.text()
+            )
             self.assertTrue(window.manager_update_button.isEnabled())
             self.assertFalse(window.manager_delete_snapshot_button.isEnabled())
             self.assertFalse(window.manager_delete_item_button.isEnabled())
+            window.close()
+
+    def test_async_manager_check_locks_and_restores_after_success_and_failure(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            snapshot_root = root / "snapshots"
+            _stored_snapshot_fixture(
+                snapshot_root,
+                "111",
+                "a" * 64,
+                "2026-08-19T12:00:00+00:00",
+                manifest_id="100",
+            )
+            result = WorkshopDetailsQueryResult(
+                (
+                    WorkshopPublishedFileDetails(
+                        "111",
+                        1,
+                        title="Async Item",
+                        workshop_manifest_id="100",
+                        consumer_app_id="108600",
+                    ),
+                )
+            )
+            started = threading.Event()
+            release = threading.Event()
+            window = ModpackWindow(run_async=True, persist_session=False)
+            window.library_edit.setText(str(root / "steam-library"))
+            window.snapshot_edit.setText(str(snapshot_root))
+            window.refresh_managed_downloads()
+            window.manager_tree.setCurrentItem(_managed_parent(window, "111"))
+            window.tabs.setCurrentIndex(window.manager_tab_index)
+            window.show()
+            self.application.processEvents()
+
+            def slow_check(_ids: object) -> WorkshopDetailsQueryResult:
+                started.set()
+                release.wait(timeout=3)
+                return result
+
+            with patch(
+                "pzmodpack.gui.query_workshop_item_details",
+                side_effect=slow_check,
+            ):
+                window.check_all_managed_workshop_updates()
+                deadline = time.monotonic() + 2
+                while not started.is_set() and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+
+                self.assertTrue(started.is_set())
+                self.application.processEvents()
+                self.assertTrue(window.manager_progress.isVisible())
+                self.assertEqual(window.manager_progress.minimum(), 0)
+                self.assertEqual(window.manager_progress.maximum(), 0)
+                self.assertIn(
+                    "without downloading", window.manager_operation_status.text()
+                )
+                self.assertFalse(window.manager_check_updates_button.isEnabled())
+                self.assertFalse(window.manager_update_button.isEnabled())
+                self.assertFalse(window.manager_refresh_button.isEnabled())
+                self.assertFalse(window.open_project_button.isEnabled())
+                self.assertFalse(window.snapshot_edit.isEnabled())
+
+                release.set()
+                deadline = time.monotonic() + 2
+                while window._workers and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+
+            self.assertFalse(window._workers)
+            self.assertFalse(window.manager_progress.isVisible())
+            self.assertTrue(window.manager_check_updates_button.isEnabled())
+            self.assertTrue(window.manager_update_button.isEnabled())
+            self.assertTrue(window.manager_refresh_button.isEnabled())
+            self.assertTrue(window.open_project_button.isEnabled())
+            self.assertTrue(window.snapshot_edit.isEnabled())
+            self.assertIn("Up to date", _managed_parent(window, "111").text(5))
+
+            with patch(
+                "pzmodpack.gui.query_workshop_item_details",
+                side_effect=RuntimeError("metadata service offline"),
+            ):
+                window.check_all_managed_workshop_updates()
+                deadline = time.monotonic() + 2
+                while window._workers and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+
+            self.assertFalse(window._workers)
+            self.assertFalse(window.manager_progress.isVisible())
+            self.assertTrue(window.manager_check_updates_button.isEnabled())
+            self.assertTrue(window.manager_refresh_button.isEnabled())
+            self.assertTrue(window.open_project_button.isEnabled())
+            self.assertTrue(window.snapshot_edit.isEnabled())
+            self.assertIn("metadata service offline", window.log.toPlainText())
             window.close()
 
     def test_async_manager_update_shows_progress_and_locks_mutations(self) -> None:
@@ -937,7 +1406,9 @@ class GuiTests(unittest.TestCase):
                 self.assertFalse(window.manager_update_button.isEnabled())
                 self.assertFalse(window.open_project_button.isEnabled())
                 self.assertFalse(window.snapshot_edit.isEnabled())
-                self.assertIn("Workshop item 1/1", window.manager_operation_status.text())
+                self.assertIn(
+                    "Workshop item 1/1", window.manager_operation_status.text()
+                )
 
                 release.set()
                 deadline = time.monotonic() + 2
@@ -1046,7 +1517,9 @@ class GuiTests(unittest.TestCase):
             self.assertFalse(window._mod_selection_needs_review)
             window.close()
 
-    def test_manager_delete_selected_snapshot_falls_back_without_resetting_mods(self) -> None:
+    def test_manager_delete_selected_snapshot_falls_back_without_resetting_mods(
+        self,
+    ) -> None:
         with TemporaryDirectory() as temporary_directory:
             snapshot_root = Path(temporary_directory) / "snapshots"
             old_hash = "a" * 64
@@ -1283,9 +1756,7 @@ class GuiTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             library = root / "steam-library"
-            cache_root = (
-                library / "steamapps" / "workshop" / "content" / "108600"
-            )
+            cache_root = library / "steamapps" / "workshop" / "content" / "108600"
             cache_mods = cache_root / "111" / "mods"
             cache_mods.mkdir(parents=True)
             sentinel = cache_mods / "keep.txt"
@@ -1297,7 +1768,9 @@ class GuiTests(unittest.TestCase):
             window.refresh_managed_downloads()
 
             self.assertEqual(window.manager_tree.topLevelItemCount(), 0)
-            self.assertIn("Unsafe snapshot library", window.manager_summary_label.text())
+            self.assertIn(
+                "Unsafe snapshot library", window.manager_summary_label.text()
+            )
             self.assertFalse(window.manager_delete_snapshot_button.isEnabled())
             self.assertFalse(window.manager_delete_item_button.isEnabled())
             window.workshop_input.setPlainText("111")
@@ -1316,7 +1789,9 @@ class GuiTests(unittest.TestCase):
             window = ModpackWindow(run_async=False, persist_session=False)
             window.output_edit.setText(str(output))
             window.workshop_edit.setText("0")
-            self.assertIn("Create new Workshop item", window.upload_destination_label.text())
+            self.assertIn(
+                "Create new Workshop item", window.upload_destination_label.text()
+            )
             window.anonymous_check.setChecked(False)
             window.username_edit.setText("sai")
             window.password_edit.setText("secret")
@@ -1334,7 +1809,9 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(upload.call_args.args[1], output.resolve())
             self.assertEqual(upload.call_args.args[3], "Initial release")
             self.assertEqual(window.workshop_edit.text(), "555")
-            self.assertIn("Update Workshop item 555", window.upload_destination_label.text())
+            self.assertIn(
+                "Update Workshop item 555", window.upload_destination_label.text()
+            )
             self.assertIn("Workshop upload succeeded", window.log.toPlainText())
             self.assertEqual(window.password_edit.text(), "")
             window.close()
@@ -1378,7 +1855,9 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(saved.version_bump, "minor")
             self.assertEqual(restored.version_bump_combo.currentData(), "minor")
             self.assertEqual(restored.visibility_combo.currentData(), 3)
-            self.assertEqual(restored.active_ids_edit.toPlainText(), "Example=ExampleB41")
+            self.assertEqual(
+                restored.active_ids_edit.toPlainText(), "Example=ExampleB41"
+            )
             self.assertEqual(restored.included_mod_ids, ("ExampleB41",))
             self.assertEqual(restored.username_edit.text(), "")
             self.assertEqual(restored.password_edit.text(), "")
