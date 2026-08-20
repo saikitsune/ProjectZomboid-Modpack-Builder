@@ -105,7 +105,7 @@ class UploadConfigTests(unittest.TestCase):
 
     def test_builds_attributed_description_with_every_bundled_workshop_mod(self) -> None:
         manifest: dict[str, object] = {
-            "description": "Curated server pack",
+            "description": 'Curated "server" pack',
             "mods": [
                 {
                     "display_name": "Second Mod",
@@ -123,6 +123,11 @@ class UploadConfigTests(unittest.TestCase):
                     "source_workshop_id": "222",
                 },
                 {
+                    "display_name": 'Anthro Survivors (the "Furry Mod")',
+                    "source_folder": "Anthro",
+                    "source_workshop_id": "333",
+                },
+                {
                     "display_name": "Local Mod",
                     "source_folder": "Local",
                     "source_workshop_id": None,
@@ -132,7 +137,7 @@ class UploadConfigTests(unittest.TestCase):
 
         description = build_workshop_description(manifest, "9.8.7")
 
-        self.assertTrue(description.startswith("Curated server pack\n\n"))
+        self.assertTrue(description.startswith("Curated “server” pack\n\n"))
         self.assertIn(
             "Modpack made with "
             "[url=https://github.com/saikitsune/ProjectZomboid-Modpack-Builder]"
@@ -143,6 +148,11 @@ class UploadConfigTests(unittest.TestCase):
         self.assertIn(
             "[url=https://steamcommunity.com/sharedfiles/filedetails/?id=111]"
             "First (Build 42) Mod (Workshop ID: 111)[/url]",
+            description,
+        )
+        self.assertIn(
+            "[url=https://steamcommunity.com/sharedfiles/filedetails/?id=333]"
+            "Anthro Survivors (the “Furry Mod”) (Workshop ID: 333)[/url]",
             description,
         )
         self.assertIn(
@@ -157,7 +167,7 @@ class UploadConfigTests(unittest.TestCase):
         )
         self.assertNotIn("Local Mod", description)
         self.assertEqual(build_workshop_description(manifest, "9.8.7"), description)
-        self.assertEqual(manifest["description"], "Curated server pack")
+        self.assertEqual(manifest["description"], 'Curated "server" pack')
 
     def test_writes_project_zomboid_workshop_upload_vdf(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -173,8 +183,8 @@ class UploadConfigTests(unittest.TestCase):
                 preview_file=preview,
                 visibility=3,
                 title='Sai "Test" Pack',
-                description="Pack description",
-                change_note="Updated mods",
+                description='Anthro Survivors (the "Furry Mod")\nPack description',
+                change_note='Updated "quoted" mods',
             )
 
             write_upload_vdf(vdf, config)
@@ -187,11 +197,56 @@ class UploadConfigTests(unittest.TestCase):
                 text,
             )
             self.assertIn('"visibility"\t\t"3"', text)
-            self.assertIn('"title"\t\t"Sai \\"Test\\" Pack"', text)
-            self.assertIn('"changenote"\t\t"Updated mods"', text)
+            self.assertIn('"title"\t\t"Sai “Test” Pack"', text)
+            self.assertIn(
+                '"description"\t\t"Anthro Survivors (the “Furry Mod”)'
+                '\\nPack description"',
+                text,
+            )
+            self.assertIn(
+                '"changenote"\t\t"Updated “quoted” mods"',
+                text,
+            )
+            self.assertNotIn('\\"', text)
+            value_lines = [line for line in text.splitlines() if line.startswith("\t")]
+            self.assertTrue(value_lines)
+            self.assertTrue(all(line.count('"') == 4 for line in value_lines))
+
+    def test_vdf_quotes_preserve_quoted_names_and_measurements(self) -> None:
+        self.assertEqual(
+            _vdf_escape('A 12" shelf named "Furry Mod"'),
+            "A 12” shelf named “Furry Mod”",
+        )
+        self.assertEqual(_vdf_escape('"Unclosed'), "“Unclosed")
+        self.assertEqual(_vdf_escape("one\r\ntwo\rthree"), "one\\ntwo\\nthree")
+
+        with self.assertRaisesRegex(ValueError, "NUL"):
+            _vdf_escape("bad\0value")
+
+    def test_rejects_quoted_workshop_paths_instead_of_rewriting_them(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = WorkshopUploadConfig(
+                published_file_id="123",
+                content_folder=root / 'bad"content',
+                preview_file=root / "preview.png",
+                visibility=2,
+                title="Pack",
+                description="Description",
+                change_note="Changes",
+            )
+
+            with self.assertRaisesRegex(ValueError, "content folder.*double quotes"):
+                write_upload_vdf(root / "upload.vdf", config)
 
     def test_rejects_generated_description_over_steam_byte_limit(self) -> None:
         manifest: dict[str, object] = {"description": "x" * 8000, "mods": []}
+
+        with self.assertRaisesRegex(ValueError, "8000-byte limit"):
+            build_workshop_description(manifest, "9.8.7")
+
+    def test_description_limit_counts_typographic_quote_bytes(self) -> None:
+        manifest: dict[str, object] = {"description": '"' * 2700, "mods": []}
 
         with self.assertRaisesRegex(ValueError, "8000-byte limit"):
             build_workshop_description(manifest, "9.8.7")

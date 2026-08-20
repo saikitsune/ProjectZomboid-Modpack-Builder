@@ -113,8 +113,34 @@ class WorkshopUploadConfig:
     change_note: str
 
 
+_OPENING_QUOTE_PRECEDERS = frozenset("([{<:=,;!?/\\—–-")
+
+
+def _typographic_double_quotes(value: str) -> str:
+    """Replace VDF-breaking ASCII quotes while preserving readable punctuation."""
+    converted: list[str] = []
+    for index, character in enumerate(value):
+        if character != '"':
+            converted.append(character)
+            continue
+        previous = value[index - 1] if index else ""
+        is_opening = (
+            not previous
+            or previous.isspace()
+            or previous in _OPENING_QUOTE_PRECEDERS
+        )
+        converted.append("“" if is_opening else "”")
+    return "".join(converted)
+
+
 def _vdf_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    # SteamCMD's Workshop KeyValues reader does not honor \" as an escaped
+    # delimiter. Typographic quotes remain readable without terminating values.
+    if "\0" in value:
+        raise ValueError("Workshop upload text cannot contain NUL characters")
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    quote_safe = _typographic_double_quotes(normalized)
+    return quote_safe.replace("\\", "\\\\").replace("\n", "\\n")
 
 
 def write_upload_vdf(path: Path, config: WorkshopUploadConfig) -> Path:
@@ -124,6 +150,15 @@ def write_upload_vdf(path: Path, config: WorkshopUploadConfig) -> Path:
         raise ValueError("Workshop visibility must be 0, 1, 2, or 3")
     content_folder = Path(config.content_folder).resolve()
     preview_file = Path(config.preview_file).resolve()
+    for field, field_path in (
+        ("content folder", content_folder),
+        ("preview file", preview_file),
+    ):
+        if '"' in str(field_path):
+            raise ValueError(
+                f"Workshop upload {field} path cannot contain double quotes: "
+                f"{field_path}"
+            )
     if not content_folder.is_dir():
         raise FileNotFoundError(f"Workshop content folder not found: {content_folder}")
     if not preview_file.is_file():
@@ -947,6 +982,7 @@ def build_workshop_description(
     description = (
         f"{base_description}\n\n{footer_text}" if base_description else footer_text
     )
+    description = _typographic_double_quotes(description)
     description_size = len(description.encode("utf-8"))
     if description_size > WORKSHOP_DESCRIPTION_MAX_BYTES:
         raise ValueError(
