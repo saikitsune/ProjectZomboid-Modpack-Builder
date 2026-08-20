@@ -317,6 +317,52 @@ class ValidationTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    @staticmethod
+    def _write_new_music_compatibility_fixture(
+        source: Path,
+        resolved_pools_text: str,
+    ) -> Path:
+        music = source / "mods" / "Talis New Music"
+        core = music / "42" / "media" / "lua" / "shared" / "core"
+        loot = music / "42" / "media" / "lua" / "shared" / "loot"
+        server_loot = music / "42" / "media" / "lua" / "server" / "loot"
+        core.mkdir(parents=True)
+        loot.mkdir(parents=True)
+        server_loot.mkdir(parents=True)
+        (music / "mod.info").write_text("id=NewMusic\n", encoding="utf-8")
+        (core / "NMTranslations.lua").write_text(
+            'local MOD_ID = "NewMusic"\n',
+            encoding="utf-8",
+        )
+        (loot / "NMManagedSpawnCatalog.lua").write_text(
+            'return lower == "newmusic" or lower == "talisnewmusic"\n'
+            'valueContainsRequiredMod(value, "NewMusic")\n',
+            encoding="utf-8",
+        )
+        (loot / "NMMediaLootPool.lua").write_text(
+            "NMMediaLootPool = NMMediaLootPool or {}\n",
+            encoding="utf-8",
+        )
+        (loot / "NMLootResolvedPools.lua").write_text(
+            resolved_pools_text,
+            encoding="utf-8",
+        )
+        (server_loot / "NMLootPolicySnapshot.lua").write_text(
+            "NMLootPolicySnapshot = NMLootPolicySnapshot or {}\n",
+            encoding="utf-8",
+        )
+        (server_loot / "NMLootRealizationAuthority.lua").write_text(
+            "NMLootRealizationAuthority = NMLootRealizationAuthority or {}\n",
+            encoding="utf-8",
+        )
+        (server_loot / "NMLootBuildContext.lua").write_text(
+            'require "loot/NMLootPolicySnapshot"\n'
+            'require "loot/NMLootRealizationAuthority"\n'
+            'require "loot/NMLootResolvedPools"\n',
+            encoding="utf-8",
+        )
+        return music
+
     def test_build_uses_one_selected_revision_per_workshop_item(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1375,6 +1421,123 @@ class BuildTests(unittest.TestCase):
                         output=root / "output",
                     )
                 )
+
+    def test_new_music_reviewed_upstream_layout_remains_shared(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            resolved_text = (
+                'require "loot/NMManagedSpawnCatalog"\n'
+                'require "loot/NMMediaLootPool"\n'
+                "\n"
+                "NMLootResolvedPools = NMLootResolvedPools or {}\n"
+                "\n"
+                "local resolvedPools = NMLootResolvedPools\n"
+                "local function clonePolicy(policy)\n"
+                "    local cloned = NMLootPolicySnapshot and "
+                "NMLootPolicySnapshot.clone and "
+                "NMLootPolicySnapshot.clone(policy) or nil\n"
+                "    return cloned\n"
+                "end\n"
+                "local function formatPolicy(policy)\n"
+                "    return NMLootPolicySnapshot and "
+                "NMLootPolicySnapshot.formatPolicy and "
+                'NMLootPolicySnapshot.formatPolicy(policy) or "unknown"\n'
+                "end\n"
+                "local function buildAuthority()\n"
+                "    local realizationAuthority = NMLootRealizationAuthority\n"
+                "        and NMLootRealizationAuthority.build\n"
+                "        and NMLootRealizationAuthority.build({})\n"
+                "    return realizationAuthority\n"
+                "end\n"
+                "return resolvedPools\n"
+            )
+            self._write_new_music_compatibility_fixture(
+                root / "source",
+                resolved_text,
+            )
+            output = root / "output"
+
+            build_modpack(
+                BuildConfig(
+                    name="Pack",
+                    namespace="SSP",
+                    sources=(root / "source",),
+                    output=output,
+                )
+            )
+
+            packed_root = (
+                output
+                / "Contents"
+                / "mods"
+                / "SSP_Talis New Music"
+                / "42"
+                / "media"
+                / "lua"
+            )
+            shared = packed_root / "shared" / "loot" / "NMLootResolvedPools.lua"
+            relocated = packed_root / "server" / "loot" / "NMLootResolvedPools.lua"
+            self.assertEqual(shared.read_text(encoding="utf-8"), resolved_text)
+            self.assertFalse(relocated.exists())
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            patch_record = next(
+                patch
+                for patch in manifest["compatibility_patches"]
+                if patch.get("name") == "new-music-server-loot-module"
+            )
+            self.assertEqual(patch_record["strategy"], "known_file_passthrough")
+            self.assertEqual(patch_record["files_moved"], 0)
+
+    def test_new_music_unknown_shared_layout_still_fails_closed(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            resolved_text = (
+                'require "loot/NMManagedSpawnCatalog"\n'
+                'require "loot/NMMediaLootPool"\n'
+                "\n"
+                "NMLootResolvedPools = NMLootResolvedPools or {}\n"
+                "\n"
+                "local resolvedPools = NMLootResolvedPools\n"
+                'require "loot/UnknownServerModule"\n'
+                "local cloned = NMLootPolicySnapshot and "
+                "NMLootPolicySnapshot.clone and "
+                "NMLootPolicySnapshot.clone(policy) or nil\n"
+                "local realizationAuthority = NMLootRealizationAuthority\n"
+                "        and NMLootRealizationAuthority.build\n"
+            )
+            music = self._write_new_music_compatibility_fixture(
+                root / "source",
+                resolved_text,
+            )
+
+            with self.assertRaisesRegex(
+                BuildError,
+                "new-music-server-loot-module found unexpected content",
+            ):
+                build_modpack(
+                    BuildConfig(
+                        name="Pack",
+                        namespace="SSP",
+                        sources=(root / "source",),
+                        output=root / "output",
+                    )
+                )
+
+            self.assertEqual(
+                (
+                    music
+                    / "42"
+                    / "media"
+                    / "lua"
+                    / "shared"
+                    / "loot"
+                    / "NMLootResolvedPools.lua"
+                ).read_text(encoding="utf-8"),
+                resolved_text,
+            )
+            self.assertFalse((root / "output").exists())
 
 
 if __name__ == "__main__":

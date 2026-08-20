@@ -271,7 +271,7 @@ A remaining `runtime_mod_lookup` or `mod_file_access` warning means the cited oc
 
 The builder deliberately avoids blind global replacement. A Mod ID can also be a module filename, translation key, save key, script namespace, option identifier, or comment. Targeted API rewrites and fail-closed compatibility patches are used instead.
 
-Known layout and script fixes are equally strict: they run only for an exact source folder, path, and expected content. They are recorded in `compatibility_patches` with strategies such as `known_layout_context`, `known_file_relocation`, and `known_file_context`. If an upstream mod changes the expected layout or text, the build stops for review instead of applying a speculative edit.
+Known layout and script fixes are equally strict: they run only for an exact source folder, path, and expected content. They are recorded in `compatibility_patches` with strategies such as `known_layout_context`, `known_file_relocation`, `known_file_passthrough`, and `known_file_context`. A passthrough records a reviewed upstream layout that no longer needs the old builder edit. If an upstream mod changes every reviewed layout or expected text, the build stops for review instead of applying a speculative edit.
 
 ## Project files
 

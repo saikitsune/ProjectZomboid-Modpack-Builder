@@ -677,6 +677,59 @@ _KNOWN_LAYOUT_COMPATIBILITY_PATCHES = (
             'require "loot/NMLootPolicySnapshot"\n'
             'require "loot/NMLootRealizationAuthority"\n'
         ),
+        "reviewed_prefix": (
+            'require "loot/NMManagedSpawnCatalog"\n'
+            'require "loot/NMMediaLootPool"\n'
+            "\n"
+            "NMLootResolvedPools = NMLootResolvedPools or {}\n"
+            "\n"
+            "local resolvedPools = NMLootResolvedPools\n"
+        ),
+        "reviewed_requires": (
+            "loot/NMManagedSpawnCatalog",
+            "loot/NMMediaLootPool",
+        ),
+        "reviewed_source_fragments": (
+            (
+                "local cloned = NMLootPolicySnapshot and "
+                "NMLootPolicySnapshot.clone and "
+                "NMLootPolicySnapshot.clone(policy) or nil"
+            ),
+            (
+                "NMLootPolicySnapshot and NMLootPolicySnapshot.formatPolicy "
+                "and NMLootPolicySnapshot.formatPolicy(policy) or \"unknown\""
+            ),
+            (
+                "local realizationAuthority = NMLootRealizationAuthority\n"
+                "        and NMLootRealizationAuthority.build"
+            ),
+        ),
+        "reviewed_identifier_counts": (
+            ("NMLootPolicySnapshot", 6),
+            ("NMLootRealizationAuthority", 3),
+        ),
+        "reviewed_file_fragments": (
+            (
+                "42/media/lua/shared/loot/NMMediaLootPool.lua",
+                "NMMediaLootPool = NMMediaLootPool or {}",
+            ),
+            (
+                "42/media/lua/server/loot/NMLootPolicySnapshot.lua",
+                "NMLootPolicySnapshot = NMLootPolicySnapshot or {}",
+            ),
+            (
+                "42/media/lua/server/loot/NMLootRealizationAuthority.lua",
+                "NMLootRealizationAuthority = NMLootRealizationAuthority or {}",
+            ),
+            (
+                "42/media/lua/server/loot/NMLootBuildContext.lua",
+                (
+                    'require "loot/NMLootPolicySnapshot"\n'
+                    'require "loot/NMLootRealizationAuthority"\n'
+                    'require "loot/NMLootResolvedPools"\n'
+                ),
+            ),
+        ),
     },
 )
 
@@ -687,6 +740,87 @@ def _known_layout_specs(source_folder: str) -> list[dict[str, object]]:
         for specification in _KNOWN_LAYOUT_COMPATIBILITY_PATCHES
         if specification["source_folder"] == source_folder
     ]
+
+
+def _lua_require_targets(text: str) -> tuple[str, ...]:
+    return tuple(
+        match.group(1)
+        for match in re.finditer(
+            r'''(?m)^[ \t]*require[ \t]*(?:\([ \t]*)?["']([^"']+)["']''',
+            text,
+        )
+    )
+
+
+def _file_relocation_action(
+    root: Path,
+    specification: dict[str, object],
+) -> tuple[str, Path, Path]:
+    name = str(specification["name"])
+    source = root / str(specification["source_file"])
+    destination = root / str(specification["destination_file"])
+    if not source.is_file() or destination.exists():
+        raise BuildError(
+            f"Compatibility patch {name} expected source {source} and no "
+            f"destination {destination}"
+        )
+    text = source.read_text(encoding="utf-8-sig")
+    if text.startswith(str(specification["expected_prefix"])):
+        return "relocate", source, destination
+
+    reviewed_prefix = str(specification.get("reviewed_prefix") or "")
+    if not reviewed_prefix or not text.startswith(reviewed_prefix):
+        raise BuildError(
+            f"Compatibility patch {name} found unexpected content in {source}"
+        )
+    reviewed_requires = tuple(
+        str(item) for item in specification.get("reviewed_requires", ())
+    )
+    actual_requires = _lua_require_targets(text)
+    if actual_requires != reviewed_requires:
+        raise BuildError(
+            f"Compatibility patch {name} found unexpected content in {source}: "
+            f"reviewed requires {reviewed_requires!r}, found {actual_requires!r}"
+        )
+    missing_source_fragments = [
+        str(fragment)
+        for fragment in specification.get("reviewed_source_fragments", ())
+        if str(fragment) not in text
+    ]
+    if missing_source_fragments:
+        raise BuildError(
+            f"Compatibility patch {name} found unexpected content in {source}: "
+            "reviewed guarded server references changed"
+        )
+    for identifier, expected_count in specification.get(
+        "reviewed_identifier_counts",
+        (),
+    ):
+        actual_count = text.count(str(identifier))
+        if actual_count != int(expected_count):
+            raise BuildError(
+                f"Compatibility patch {name} found unexpected content in {source}: "
+                f"expected {expected_count} reviewed {identifier} reference(s), "
+                f"found {actual_count}"
+            )
+    for relative_file, fragment in specification.get(
+        "reviewed_file_fragments",
+        (),
+    ):
+        companion = root / str(relative_file)
+        try:
+            companion_text = companion.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as error:
+            raise BuildError(
+                f"Compatibility patch {name} expected reviewed companion file "
+                f"{companion}"
+            ) from error
+        if str(fragment) not in companion_text:
+            raise BuildError(
+                f"Compatibility patch {name} found unexpected content in reviewed "
+                f"companion file {companion}"
+            )
+    return "reviewed_passthrough", source, destination
 
 
 def _validate_known_layout_compatibility_patches(mod: DiscoveredMod) -> None:
@@ -725,18 +859,7 @@ def _validate_known_layout_compatibility_patches(mod: DiscoveredMod) -> None:
                     f"{root_info}"
                 )
         elif kind == "relocate_file":
-            source = mod.mod_directory / str(specification["source_file"])
-            destination = mod.mod_directory / str(specification["destination_file"])
-            if not source.is_file() or destination.exists():
-                raise BuildError(
-                    f"Compatibility patch {name} expected source {source} and no "
-                    f"destination {destination}"
-                )
-            text = source.read_text(encoding="utf-8-sig")
-            if not text.startswith(str(specification["expected_prefix"])):
-                raise BuildError(
-                    f"Compatibility patch {name} found unexpected content in {source}"
-                )
+            _file_relocation_action(mod.mod_directory, specification)
         else:
             raise BuildError(f"Unknown compatibility layout patch kind: {kind}")
 
@@ -771,8 +894,21 @@ def _apply_known_layout_compatibility_patches(
                 }
             )
         elif kind == "relocate_file":
-            source = destination / str(specification["source_file"])
-            relocated = destination / str(specification["destination_file"])
+            action, source, relocated = _file_relocation_action(
+                destination,
+                specification,
+            )
+            if action == "reviewed_passthrough":
+                records.append(
+                    {
+                        "name": name,
+                        "strategy": "known_file_passthrough",
+                        "file": source.relative_to(mods_root).as_posix(),
+                        "files_moved": 0,
+                        "layout": "reviewed_upstream_shared_dependencies",
+                    }
+                )
+                continue
             relocated.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(source), str(relocated))
             records.append(

@@ -42,7 +42,7 @@ class GuiTests(unittest.TestCase):
             (mod / "mod.info").write_text("name=Example\nid=ExampleId\n", encoding="utf-8")
             destination = root / "built"
             window = ModpackWindow(run_async=False, persist_session=False)
-            self.assertIn("v0.6.1", window.windowTitle())
+            self.assertIn("v0.6.2", window.windowTitle())
             window.name_edit.setText("GUI Pack")
             window.namespace_edit.setText("GuiPack")
             window.workshop_edit.setText("123")
@@ -419,7 +419,7 @@ class GuiTests(unittest.TestCase):
             window.test_steam_login()
         log = window.log.toPlainText()
         self.assertIn("Steam login succeeded", log)
-        self.assertIn("PZ Modpack Builder v0.6.1", log)
+        self.assertIn("PZ Modpack Builder v0.6.2", log)
         self.assertNotIn("super-secret", log)
         self.assertNotIn("ABCDE", log)
         self.assertEqual(window.password_edit.text(), "")
