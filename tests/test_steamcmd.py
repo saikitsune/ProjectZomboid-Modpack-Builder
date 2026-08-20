@@ -28,6 +28,35 @@ from pzmodpack.steamcmd import (
 )
 
 
+def _parse_workshop_vdf(text: str) -> dict[str, str]:
+    """Parse the no-escape KeyValues subset emitted for Workshop uploads."""
+    tokens: list[str] = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character.isspace():
+            index += 1
+            continue
+        if character in "{}":
+            tokens.append(character)
+            index += 1
+            continue
+        if character != '"':
+            raise AssertionError(f"Unexpected VDF character at offset {index}")
+        end = text.find('"', index + 1)
+        if end < 0:
+            raise AssertionError(f"Unterminated VDF value at offset {index}")
+        tokens.append(text[index + 1 : end])
+        index = end + 1
+
+    if tokens[:2] != ["workshopitem", "{"] or tokens[-1:] != ["}"]:
+        raise AssertionError(f"Unexpected Workshop VDF structure: {tokens!r}")
+    entries = tokens[2:-1]
+    if len(entries) % 2:
+        raise AssertionError(f"Unpaired Workshop VDF entry: {entries!r}")
+    return dict(zip(entries[::2], entries[1::2], strict=True))
+
+
 class WorkshopIdTests(unittest.TestCase):
     def test_parses_ids_and_workshop_urls_without_duplicates(self) -> None:
         values = [
@@ -184,7 +213,7 @@ class UploadConfigTests(unittest.TestCase):
                 visibility=3,
                 title='Sai "Test" Pack',
                 description='Anthro Survivors (the "Furry Mod")\nPack description',
-                change_note='Updated "quoted" mods',
+                change_note='Updated "quoted" mods\n\nKept // notes, {braces}, and\ttabs',
             )
 
             write_upload_vdf(vdf, config)
@@ -200,17 +229,29 @@ class UploadConfigTests(unittest.TestCase):
             self.assertIn('"title"\t\t"Sai “Test” Pack"', text)
             self.assertIn(
                 '"description"\t\t"Anthro Survivors (the “Furry Mod”)'
-                '\\nPack description"',
+                '\nPack description"',
                 text,
             )
             self.assertIn(
-                '"changenote"\t\t"Updated “quoted” mods"',
+                '"changenote"\t\t"Updated “quoted” mods\n\n'
+                'Kept // notes, {braces}, and\ttabs"',
                 text,
             )
             self.assertNotIn('\\"', text)
-            value_lines = [line for line in text.splitlines() if line.startswith("\t")]
-            self.assertTrue(value_lines)
-            self.assertTrue(all(line.count('"') == 4 for line in value_lines))
+            fields = _parse_workshop_vdf(text)
+            self.assertEqual(len(fields), 8)
+            self.assertEqual(fields["contentfolder"], str(content.resolve()))
+            self.assertEqual(fields["title"], "Sai “Test” Pack")
+            self.assertEqual(
+                fields["description"],
+                "Anthro Survivors (the “Furry Mod”)\nPack description",
+            )
+            self.assertEqual(
+                fields["changenote"],
+                "Updated “quoted” mods\n\nKept // notes, {braces}, and\ttabs",
+            )
+            self.assertNotIn("\\n", fields["description"])
+            self.assertNotIn(b"\r\n", vdf.read_bytes())
 
     def test_vdf_quotes_preserve_quoted_names_and_measurements(self) -> None:
         self.assertEqual(
@@ -218,10 +259,14 @@ class UploadConfigTests(unittest.TestCase):
             "A 12” shelf named “Furry Mod”",
         )
         self.assertEqual(_vdf_escape('"Unclosed'), "“Unclosed")
-        self.assertEqual(_vdf_escape("one\r\ntwo\rthree"), "one\\ntwo\\nthree")
+        self.assertEqual(_vdf_escape("one\r\ntwo\rthree"), "one\ntwo\nthree")
+        self.assertEqual(_vdf_escape(r"C:\mods\pack"), r"C:\mods\pack")
+        self.assertEqual(_vdf_escape(r"literal\ntext"), r"literal\ntext")
 
         with self.assertRaisesRegex(ValueError, "NUL"):
             _vdf_escape("bad\0value")
+        with self.assertRaisesRegex(ValueError, "DEL"):
+            _vdf_escape("bad\x7fvalue")
 
     def test_rejects_quoted_workshop_paths_instead_of_rewriting_them(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -313,15 +358,15 @@ class UploadConfigTests(unittest.TestCase):
                 upload_vdf,
             )
             self.assertNotIn("stale", upload_vdf)
-            self.assertIn(
-                '"changenote"\t\t"Test Pack v1.0.0\\n\\nInitial build."',
-                upload_vdf,
-            )
             expected_description = build_workshop_description(manifest_payload)
-            self.assertIn(
-                f'"description"\t\t"{_vdf_escape(expected_description)}"',
-                upload_vdf,
+            fields = _parse_workshop_vdf(upload_vdf)
+            self.assertEqual(
+                fields["changenote"],
+                "Test Pack v1.0.0\n\nInitial build.",
             )
+            self.assertEqual(fields["description"], expected_description)
+            self.assertNotIn("\\n", fields["changenote"])
+            self.assertNotIn("\\n", fields["description"])
             manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["workshop_id"], "555")
             self.assertIn("WorkshopItems=555;", (output / "amp-config.txt").read_text())

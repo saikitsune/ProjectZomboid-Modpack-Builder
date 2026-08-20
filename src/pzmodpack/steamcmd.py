@@ -134,13 +134,15 @@ def _typographic_double_quotes(value: str) -> str:
 
 
 def _vdf_escape(value: str) -> str:
-    # SteamCMD's Workshop KeyValues reader does not honor \" as an escaped
-    # delimiter. Typographic quotes remain readable without terminating values.
+    # SteamCMD's Workshop KeyValues reader does not enable escape-sequence
+    # conversion. Keep real line breaks and backslashes verbatim, and replace
+    # only ASCII quotes that would otherwise terminate the value.
     if "\0" in value:
         raise ValueError("Workshop upload text cannot contain NUL characters")
+    if "\x7f" in value:
+        raise ValueError("Workshop upload text cannot contain DEL characters")
     normalized = value.replace("\r\n", "\n").replace("\r", "\n")
-    quote_safe = _typographic_double_quotes(normalized)
-    return quote_safe.replace("\\", "\\\\").replace("\n", "\\n")
+    return _typographic_double_quotes(normalized)
 
 
 def write_upload_vdf(path: Path, config: WorkshopUploadConfig) -> Path:
@@ -181,7 +183,7 @@ def write_upload_vdf(path: Path, config: WorkshopUploadConfig) -> Path:
     lines.extend(("}", ""))
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
     return path
 
 
